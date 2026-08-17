@@ -1,0 +1,31 @@
+# Generated PaperBench inputs, authoring traces, and final Harbor batches.
+/paper_sources/
+/design/
+/papers/
+/splits/
+
+# Local runtime bundles and legacy staging utilities are not part of PaperFactory.
+/environment/
+/tools/
+/manifest.json
+/RUBRIC_ADDENDUM_AUTHORING_GUIDE.md
+
+# Python/editor/OS artifacts.
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+.DS_Store
+.idea/
+.vscode/
+
+# Local credentials and environments.
+.env
+.env.*
+!.env.example
+.venv/
+venv/
+

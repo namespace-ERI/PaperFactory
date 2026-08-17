@@ -1,0 +1,30 @@
+{
+  "collection_id": "paperbench-example-v1",
+  "papers": [
+    {
+      "id": "example-paper",
+      "title": "Full Paper Title",
+      "pdf_path": "sources/example.pdf",
+      "markdown_path": "sources/example.md",
+      "assets_path": "sources/example-assets",
+      "official_repo": "https://github.com/author/repository",
+      "planned_scope": "Reproduce the main method and the principal main-text experiment.",
+      "primary_artifacts": [
+        "Main result table",
+        "Key ablation"
+      ],
+      "datasets": [
+        {
+          "name": "Dataset A",
+          "role": "training and evaluation",
+          "open": true,
+          "url": "https://example.org/dataset-a"
+        }
+      ],
+      "compute": {
+        "accelerator": "1 x NVIDIA H200 120GB",
+        "max_wall_time_hours": 24
+      }
+    }
+  ]
+}

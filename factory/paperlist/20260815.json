@@ -1,0 +1,793 @@
+{
+    "collection_id": "paperbench-top20-v1",
+    "papers": [
+      {
+        "id": "fb-representations",
+        "title": "Learning One Representation to Optimize All Rewards",
+        "paper_url": "https://arxiv.org/abs/2103.07945",
+        "pdf_url": "https://arxiv.org/pdf/2103.07945",
+        "official_repo": "https://github.com/ahmed-touati/controllable_agent",
+        "source_paperbench_id": "fre",
+        "selection_reason": "与源论文同属无监督/零样本强化学习，均先学习可复用的奖励或动力学表示，再针对事后指定的奖励直接产生策略。",
+        "planned_scope": "选择 Continuous Maze 或 FetchReach，完成 FB 表示训练、零样本奖励适配和至少一个 goal-oriented baseline；3 个随机种子。",
+        "primary_artifacts": [
+          "Success rate curves for goal-reaching tasks",
+          "Trajectories for complex rewards (forbidden states, multiple goals)",
+          "Success rate",
+          "Expected discounted reward ratio"
+        ],
+        "datasets": [
+          {
+            "name": "Discrete Maze",
+            "role": "training/evaluation",
+            "open": null,
+            "url": null
+          },
+          {
+            "name": "Continuous Maze",
+            "role": "training/evaluation",
+            "open": null,
+            "url": null
+          },
+          {
+            "name": "FetchReach",
+            "role": "training/evaluation",
+            "open": null,
+            "url": null
+          },
+          {
+            "name": "Ms. Pacman",
+            "role": "training/evaluation",
+            "open": null,
+            "url": null
+          }
+        ],
+        "compute": {
+          "status": "scoped_feasible",
+          "accelerator": "1 x H200 120GB",
+          "notes": "论文未报告 GPU 型号、数量或总时长；官方实现为 PyTorch RL，任务包括 maze、FetchReach 和 Ms. Pacman。 模型显存需求很小，单卡无压力；主要耗时在环境交互而非 GPU。 Non-GPU risks: 环境采样时间; 完整多环境 sweep 的总时长未知"
+        }
+      },
+      {
+        "id": "unlikelihood-training",
+        "title": "Neural Text Generation with Unlikelihood Training",
+        "paper_url": "https://arxiv.org/abs/1908.04319",
+        "pdf_url": "https://arxiv.org/pdf/1908.04319",
+        "official_repo": "https://github.com/facebookresearch/unlikelihood_training",
+        "source_paperbench_id": "mechanistic-understanding",
+        "selection_reason": "同样通过显式偏好/负反馈目标抑制不期望的语言模型行为，具有清晰损失函数、毒性/生成实验和可复现代码。",
+        "planned_scope": "使用 GPT-2 medium + WikiText-103，复现 MLE 与 token/sequence unlikelihood 的 perplexity 和 repetition 对比；用梯度累积保持有效 batch。",
+        "primary_artifacts": [
+          "Reduction in sequence-level repetition (seq-rep-4) on Wikitext-103",
+          "Human evaluation win rates",
+          "perplexity",
+          "repetition (seq-rep-4)",
+          "unique tokens",
+          "human win rate"
+        ],
+        "datasets": [
+          {
+            "name": "Wikitext-103",
+            "role": "training/evaluation",
+            "open": true,
+            "url": null
+          }
+        ],
+        "compute": {
+          "status": "scoped_feasible",
+          "accelerator": "1 x H200 120GB",
+          "notes": "固定序列长度 1536；原论文使用 8 张未注明型号的 GPU，最多训练 150k updates。 模型和优化器可放入 120GB；单卡可以运行，但不保证达到原 8 卡 wall-clock。 Non-GPU risks: 150k updates 可能耗时较长; 原论文人工评价不纳入 task"
+        }
+      },
+      {
+        "id": "transferring-gans",
+        "title": "Transferring GANs: generating images from limited data",
+        "paper_url": "https://arxiv.org/abs/1805.01677",
+        "pdf_url": "https://arxiv.org/pdf/1805.01677",
+        "official_repo": "https://github.com/yaxingwang/Transferring-GANs",
+        "source_paperbench_id": "bridging-data-gaps",
+        "selection_reason": "两者核心问题都是小数据生成模型的迁移学习；模型家族不同，但训练设定、数据缺口与迁移评测最接近。",
+        "planned_scope": "在一个低分辨率目标域上比较预训练 GAN 迁移与从头训练，报告 FID/IW 及收敛曲线。",
+        "primary_artifacts": [
+          "Generated images from transferred GANs",
+          "Analysis of dataset size and source domain effects",
+          "FID",
+          "IS"
+        ],
+        "datasets": [
+          {
+            "name": "CIFAR-10",
+            "role": "training/evaluation",
+            "open": true,
+            "url": null
+          },
+          {
+            "name": "CIFAR-100",
+            "role": "training/evaluation",
+            "open": true,
+            "url": null
+          },
+          {
+            "name": "ImageNet",
+            "role": "training/evaluation",
+            "open": true,
+            "url": null
+          },
+          {
+            "name": "Places",
+            "role": "training/evaluation",
+            "open": true,
+            "url": null
+          },
+          {
+            "name": "LSUN",
+            "role": "training/evaluation",
+            "open": true,
+            "url": null
+          },
+          {
+            "name": "CelebA",
+            "role": "training/evaluation",
+            "open": true,
+            "url": null
+          },
+          {
+            "name": "Anime",
+            "role": "training/evaluation",
+            "open": true,
+            "url": null
+          }
+        ],
+        "compute": {
+          "status": "direct_feasible",
+          "accelerator": "1 x H200 120GB",
+          "notes": "论文只说明获得 NVIDIA GPU 支持，未报告型号/数量/时长；实验包含 25k iterations 的迁移训练。 老一代 GAN 规模远低于 120GB 显存限制；单卡资源足够。 Non-GPU risks: 旧版 TensorFlow/PyTorch 依赖兼容性; 预训练权重下载"
+        }
+      },
+      {
+        "id": "tent",
+        "title": "Tent: Fully Test-Time Adaptation by Entropy Minimization",
+        "paper_url": "https://arxiv.org/abs/2006.10726",
+        "pdf_url": "https://arxiv.org/pdf/2006.10726",
+        "official_repo": "https://github.com/DequanWang/tent",
+        "source_paperbench_id": "test-time-model-adaptation",
+        "selection_reason": "直接的 test-time adaptation 方法和实验 baseline；只依赖测试流和已训练模型，任务边界清楚，适合作为 PaperBench 复现目标。",
+        "planned_scope": "Reproduce fully test-time entropy minimization on CIFAR-10-C and CIFAR-100-C, including source, normalization-statistics adaptation, and Tent comparisons plus the normalization-parameter ablation.",
+        "primary_artifacts": [
+          "Mean corruption error table",
+          "Per-corruption error table",
+          "Normalization-parameter ablation"
+        ],
+        "datasets": [
+          {
+            "name": "CIFAR-10-C",
+            "role": "evaluation",
+            "open": true,
+            "url": "https://zenodo.org/records/2535967"
+          },
+          {
+            "name": "CIFAR-100-C",
+            "role": "evaluation",
+            "open": true,
+            "url": "https://zenodo.org/records/3555552"
+          },
+          {
+            "name": "CIFAR-10/100",
+            "role": "source pretrained models",
+            "open": true,
+            "url": "https://www.cs.toronto.edu/~kriz/cifar.html"
+          }
+        ],
+        "compute": {
+          "status": "direct_feasible",
+          "accelerator": "1 x H200 120GB",
+          "notes": "Adaptation is inference-time and updates only normalization affine parameters; no source retraining is required for the scoped task."
+        }
+      },
+      {
+        "id": "gsdm",
+        "title": "Graphically Structured Diffusion Models",
+        "paper_url": "https://arxiv.org/abs/2210.11633",
+        "pdf_url": "https://arxiv.org/pdf/2210.11633",
+        "official_repo": "https://github.com/plai-group/gsdm",
+        "source_paperbench_id": "all-in-one",
+        "selection_reason": "同样用结构化注意力/图结构约束扩散模型处理多变量联合分布，是 Simformer 在模型形式上最接近的相关工作。",
+        "planned_scope": "选择 BCMF 或 Sudoku，比较 structured attention、unstructured transformer 和关键 ablation。",
+        "primary_artifacts": [
+          "Trained GSDM models for BCMF, Sudoku, sorting, and Boolean tasks",
+          "Ablation studies showing benefits of structured attention and intermediate variables",
+          "reconstruction error",
+          "constraint violations",
+          "RMSE",
+          "accuracy"
+        ],
+        "datasets": [
+          {
+            "name": "BCMF",
+            "role": "training/evaluation",
+            "open": null,
+            "url": null
+          },
+          {
+            "name": "Sudoku",
+            "role": "training/evaluation",
+            "open": null,
+            "url": null
+          },
+          {
+            "name": "Sorting",
+            "role": "training/evaluation",
+            "open": null,
+            "url": null
+          },
+          {
+            "name": "Boolean",
+            "role": "training/evaluation",
+            "open": null,
+            "url": null
+          }
+        ],
+        "compute": {
+          "status": "scoped_feasible",
+          "accelerator": "1 x H200 120GB",
+          "notes": "论文未报告 GPU 型号、数量和训练时长；任务是 BCMF、Sudoku、sorting 和 Boolean synthetic problems。 单任务模型可放入一张 H200；完整四任务、多尺寸 sweep 的时长未知。 Non-GPU risks: 论文未给 compute statement; 完整 sweep 可能较长"
+        }
+      },
+      {
+        "id": "sequential-neural-likelihood",
+        "title": "Sequential Neural Likelihood: Fast Likelihood-free Inference with Autoregressive Flows",
+        "paper_url": "https://arxiv.org/abs/1805.07226",
+        "pdf_url": "https://arxiv.org/pdf/1805.07226",
+        "official_repo": "https://github.com/gpapamak/snl",
+        "source_paperbench_id": "sequential-neural-score-estimation",
+        "selection_reason": "同属 sequential simulation-based inference，通过逐轮聚焦模拟预算逼近后验；方法、benchmark 和评测协议高度相似。",
+        "planned_scope": "Implement sequential neural likelihood with an autoregressive density estimator on the toy complex-posterior problem and one scientific simulator, comparing posterior quality against simulation budget.",
+        "primary_artifacts": [
+          "Toy posterior visualization or quantitative distance",
+          "Simulation-budget curve",
+          "Scientific-simulator posterior comparison"
+        ],
+        "datasets": [
+          {
+            "name": "Toy complex-posterior simulator",
+            "role": "training and evaluation",
+            "open": true,
+            "url": null
+          },
+          {
+            "name": "M/G/1 or Lotka-Volterra simulator",
+            "role": "training and evaluation",
+            "open": true,
+            "url": null
+          }
+        ],
+        "compute": {
+          "status": "direct_feasible",
+          "accelerator": "CPU or 1 x H200 120GB",
+          "notes": "The neural density estimator is small; simulator wall time, not GPU memory, is the primary constraint."
+        }
+      },
+      {
+        "id": "free-adversarial-training",
+        "title": "Adversarial Training for Free!",
+        "paper_url": "https://arxiv.org/abs/1904.12843",
+        "pdf_url": "https://arxiv.org/pdf/1904.12843",
+        "official_repo": "https://github.com/ashafahi/free_adv_train",
+        "source_paperbench_id": "robust-clip",
+        "selection_reason": "同属对抗微调与鲁棒表示学习，并强调降低 adversarial training 成本；比通用 VLM 论文更像可独立复现的算法任务。",
+        "planned_scope": "优先复现 CIFAR-10 的 free adversarial training 与 PGD baseline；若要求 ImageNet，使用单卡、梯度累积并单独设长时任务。",
+        "primary_artifacts": [
+          "Robust model trained on ImageNet with 40% accuracy against PGD attacks",
+          "Robust models on CIFAR-10 and CIFAR-100 with comparable robustness to PGD training",
+          "accuracy",
+          "robustness"
+        ],
+        "datasets": [
+          {
+            "name": "CIFAR-10",
+            "role": "training/evaluation",
+            "open": null,
+            "url": null
+          },
+          {
+            "name": "CIFAR-100",
+            "role": "training/evaluation",
+            "open": null,
+            "url": null
+          },
+          {
+            "name": "ImageNet",
+            "role": "training/evaluation",
+            "open": null,
+            "url": null
+          }
+        ],
+        "compute": {
+          "status": "feasible_long_running",
+          "accelerator": "1 x H200 120GB",
+          "notes": "ImageNet 主实验使用 4×P100，约 2 天；ResNet-101/152 分别约为 ResNet-50 时长的 1.7×/2.4×。 120GB 可容纳模型和 batch；算法不依赖跨卡通信，但单卡 ImageNet wall-clock 需实测，不能直接承诺 2 天内。 Non-GPU risks: ImageNet 数据与存储; 攻击评测耗时; 原始 launcher 的多卡参数需改为单卡"
+        }
+      },
+      {
+        "id": "example-forgetting",
+        "title": "An Empirical Study of Example Forgetting during Deep Neural Network Learning",
+        "paper_url": "https://arxiv.org/abs/1812.05159",
+        "pdf_url": "https://arxiv.org/pdf/1812.05159",
+        "official_repo": "https://github.com/mtoneva/example_forgetting",
+        "source_paperbench_id": "what-will-my-model-forget",
+        "selection_reason": "直接研究样本级 forgetting event，并从训练轨迹预测哪些样本会被遗忘；与源论文的样本级遗忘预测目标最一致。",
+        "planned_scope": "Record forgetting events during CIFAR-10 training, test stability across seeds or architectures, and reproduce the effect of removing unforgettable examples on test accuracy.",
+        "primary_artifacts": [
+          "Forgetting-event distribution",
+          "Cross-run forgetting-rank agreement",
+          "Data-removal accuracy curve"
+        ],
+        "datasets": [
+          {
+            "name": "CIFAR-10",
+            "role": "training and evaluation",
+            "open": true,
+            "url": "https://www.cs.toronto.edu/~kriz/cifar.html"
+          }
+        ],
+        "compute": {
+          "status": "direct_feasible",
+          "accelerator": "1 x H200 120GB",
+          "notes": "Small image models and CIFAR-10 fit comfortably; multiple seeds can be run serially."
+        }
+      },
+      {
+        "id": "pinns-ntk",
+        "title": "When and why PINNs fail to train: A neural tangent kernel perspective",
+        "paper_url": "https://arxiv.org/abs/2007.14527",
+        "pdf_url": "https://arxiv.org/pdf/2007.14527",
+        "official_repo": "https://github.com/PredictiveIntelligenceLab/PINNsNTK",
+        "source_paperbench_id": "pinn",
+        "selection_reason": "同样解释 PINN 训练失败及不同损失项的优化失衡，只是分析工具从 loss landscape 换为 NTK；实验链条几乎可复用。",
+        "planned_scope": "Reproduce standard and NTK-guided adaptive-loss PINNs on the 1D Poisson and wave problems, including relative L2 error, loss convergence, and at least one NTK spectrum or eigenvalue-dynamics result.",
+        "primary_artifacts": [
+          "Relative L2 error comparison",
+          "Loss-component convergence curves",
+          "NTK spectrum or eigenvalue dynamics"
+        ],
+        "datasets": [
+          {
+            "name": "Poisson equation collocation data",
+            "role": "training and evaluation",
+            "open": true,
+            "url": null
+          },
+          {
+            "name": "Wave equation collocation data",
+            "role": "training and evaluation",
+            "open": true,
+            "url": null
+          }
+        ],
+        "compute": {
+          "status": "direct_feasible",
+          "accelerator": "1 x H200 120GB",
+          "notes": "Synthetic collocation data and small fully connected networks make the scoped experiments inexpensive."
+        }
+      },
+      {
+        "id": "gedi",
+        "title": "GeDi: Generative Discriminator Guided Sequence Generation",
+        "paper_url": "https://arxiv.org/abs/2009.06367",
+        "pdf_url": "https://arxiv.org/pdf/2009.06367",
+        "official_repo": "https://github.com/salesforce/GeDi",
+        "source_paperbench_id": "stay-on-topic-with-classifier-free-guidance",
+        "selection_reason": "同为无需重训主语言模型的生成时引导方法，通过正负条件分数控制主题和属性，形式上最接近 classifier-free guidance。",
+        "planned_scope": "Train one topic or sentiment GeDi and use it to guide GPT-2 generation, comparing unguided generation, GeDi, and PPLM with automatic attribute accuracy, perplexity, and generation speed; human evaluation is excluded.",
+        "primary_artifacts": [
+          "Automatic controllability results",
+          "Perplexity or fluency results",
+          "Generation-speed comparison"
+        ],
+        "datasets": [
+          {
+            "name": "AG News",
+            "role": "topic-control training and evaluation",
+            "open": true,
+            "url": "https://huggingface.co/datasets/fancyzhx/ag_news"
+          },
+          {
+            "name": "IMDb",
+            "role": "sentiment-control training and evaluation",
+            "open": true,
+            "url": "https://ai.stanford.edu/~amaas/data/sentiment/"
+          }
+        ],
+        "compute": {
+          "status": "direct_feasible",
+          "accelerator": "1 x H200 120GB",
+          "notes": "The paper reports single-GPU training in under one day; one automatic-evaluation control setting is suitable for an H200 task."
+        }
+      },
+      {
+        "id": "statemask",
+        "title": "StateMask: Explaining Deep Reinforcement Learning through State Masking",
+        "paper_url": "https://openreview.net/forum?id=pzc6LnUxYN",
+        "pdf_url": "https://papers.neurips.cc/paper_files/paper/2023/file/c4bf73386022473a652a18941e9ea6f8-Paper-Conference.pdf",
+        "official_repo": "https://github.com/nuwuxian/RL-state_mask",
+        "source_paperbench_id": "rice",
+        "selection_reason": "同属强化学习解释生成，并以解释质量及策略行为改进做定量评测；它还是 RICE 的实验 baseline，最符合新的一对一条件。",
+        "planned_scope": "选择 Pong 或 Connect 4，复现 StateMask 与 1–2 个 explainer 的 explanation score 和 masked-policy value difference；3–5 seeds。",
+        "primary_artifacts": [
+          "Explanation score comparison",
+          "Masked-policy value-difference comparison",
+          "Explanation runtime comparison"
+        ],
+        "datasets": [
+          {
+            "name": "Pong or Connect Four interaction trajectories",
+            "role": "training/evaluation",
+            "open": true,
+            "url": "https://github.com/nuwuxian/RL-state_mask"
+          }
+        ],
+        "compute": {
+          "status": "scoped_feasible",
+          "accelerator": "1 x H200 120GB",
+          "notes": "论文未明确报告 GPU 型号；覆盖 Pong、Connect 4、StarCraft II 等 10 个任务，部分实验包含 500 runs。 解释模型本身较小，单卡足够；不应把完整 StarCraft II 和 500-run sweep 设为必做。 Non-GPU risks: 环境/agent checkpoint 获取; 完整 500 runs 的环境时间"
+        }
+      },
+      {
+        "id": "autovp",
+        "title": "AutoVP: An Automated Visual Prompting Framework and Benchmark",
+        "paper_url": "https://arxiv.org/abs/2310.08381",
+        "pdf_url": "https://arxiv.org/pdf/2310.08381",
+        "official_repo": "https://github.com/IBM/AutoVP",
+        "source_paperbench_id": "sample-specific-masks",
+        "selection_reason": "同属视觉重编程/视觉 prompting，均冻结预训练模型并学习输入变换；AutoVP 的自动 prompt 搜索与 sample-specific mask 最接近。",
+        "planned_scope": "Jointly optimize input scaling, a visual prompt, and label mapping on two or three public image-classification datasets, comparing against fixed visual prompting and a linear probe.",
+        "primary_artifacts": [
+          "Multi-dataset accuracy table",
+          "Component ablation",
+          "Prompt or scaling visualization"
+        ],
+        "datasets": [
+          {
+            "name": "CIFAR-10",
+            "role": "training and evaluation",
+            "open": true,
+            "url": "https://www.cs.toronto.edu/~kriz/cifar.html"
+          },
+          {
+            "name": "SVHN",
+            "role": "training and evaluation",
+            "open": true,
+            "url": "http://ufldl.stanford.edu/housenumbers/"
+          },
+          {
+            "name": "EuroSAT",
+            "role": "training and evaluation",
+            "open": true,
+            "url": "https://github.com/phelber/EuroSAT"
+          }
+        ],
+        "compute": {
+          "status": "direct_feasible",
+          "accelerator": "1 x H200 120GB",
+          "notes": "The paper reports a single RTX 3090 setup; the scoped dataset subset fits comfortably on one H200."
+        }
+      },
+      {
+        "id": "adalora",
+        "title": "AdaLoRA: Adaptive Budget Allocation for Parameter-Efficient Fine-Tuning",
+        "paper_url": "https://arxiv.org/abs/2303.10512",
+        "pdf_url": "https://arxiv.org/pdf/2303.10512",
+        "official_repo": "https://github.com/QingruZhang/AdaLoRA",
+        "source_paperbench_id": "adaptive-pruning",
+        "selection_reason": "与 APT 一样根据参数重要性动态分配有限微调预算；虽然采用低秩适配而非剪枝，但自适应预算设定和评测最接近且官方仓库当前可达。",
+        "planned_scope": "Compare LoRA and AdaLoRA under matched trainable-parameter budgets using a base-sized encoder on two or three GLUE tasks, and analyze the learned rank allocation.",
+        "primary_artifacts": [
+          "Matched-budget GLUE results",
+          "Trainable-parameter count",
+          "Layerwise rank-allocation analysis"
+        ],
+        "datasets": [
+          {
+            "name": "GLUE",
+            "role": "training and evaluation",
+            "open": true,
+            "url": "https://huggingface.co/datasets/nyu-mll/glue"
+          }
+        ],
+        "compute": {
+          "status": "direct_feasible",
+          "accelerator": "1 x H200 120GB",
+          "notes": "Base-sized encoders and parameter-efficient fine-tuning fit on one H200; tasks should be run serially."
+        }
+      },
+      {
+        "id": "ppo",
+        "title": "Proximal Policy Optimization Algorithms",
+        "paper_url": "https://arxiv.org/abs/1707.06347",
+        "pdf_url": "https://arxiv.org/pdf/1707.06347",
+        "official_repo": "https://github.com/openai/baselines",
+        "source_paperbench_id": "sapg",
+        "selection_reason": "PPO 是 SAPG 的直接策略梯度 baseline；相较依赖大规模 actor-learner 集群的 IMPALA，PPO 的官方实现可在单机单卡上保留完整算法和主要控制任务评测。",
+        "planned_scope": "选择 2 个 MuJoCo/Procgen 或 1 个 Atari 环境，复现 PPO-Clip 对 TRPO/A2C 的 sample efficiency；3 seeds。",
+        "primary_artifacts": [
+          "Learning curve",
+          "Sample-efficiency comparison",
+          "PPO clipped-objective ablation"
+        ],
+        "datasets": [
+          {
+            "name": "Gymnasium MuJoCo environments",
+            "role": "training/evaluation",
+            "open": true,
+            "url": "https://gymnasium.farama.org/environments/mujoco/"
+          },
+          {
+            "name": "Arcade Learning Environment",
+            "role": "training/evaluation",
+            "open": true,
+            "url": "https://github.com/Farama-Foundation/Arcade-Learning-Environment"
+          }
+        ],
+        "compute": {
+          "status": "direct_feasible",
+          "accelerator": "1 x H200 120GB",
+          "notes": "原论文未给统一 GPU 数；官方 ppo2 支持 GPU，并通过并行环境采样。典型复现为 MuJoCo 1–3M steps 或 Atari 10M+ steps。 策略网络很小，单卡显存无压力；CPU 环境吞吐是主要瓶颈。 Non-GPU risks: MuJoCo 版本和许可证兼容; 环境采样的 CPU 核数"
+        }
+      },
+      {
+        "id": "agreement-on-the-line",
+        "title": "Agreement-on-the-Line: Predicting the Performance of Neural Networks under Distribution Shift",
+        "paper_url": "https://arxiv.org/abs/2206.13089",
+        "pdf_url": "https://arxiv.org/pdf/2206.13089",
+        "official_repo": "https://github.com/kebaek/agreement-on-the-line",
+        "source_paperbench_id": "lca-on-the-line",
+        "selection_reason": "源论文在命名、问题设定和线性预测框架上直接延续该工作；都是用 ID 统计量预测 OOD 性能，是 20 组中最强的一一对应。",
+        "planned_scope": "Using predictions from 10 to 20 public CIFAR-10 models, reproduce agreement-on-the-line and ALine-D on CIFAR-10.1, CIFAR-10.2, and CINIC-10, reporting OOD-accuracy prediction MAE and goodness of fit.",
+        "primary_artifacts": [
+          "Agreement-versus-accuracy plot",
+          "ALine-D OOD accuracy predictions",
+          "MAE and R-squared table"
+        ],
+        "datasets": [
+          {
+            "name": "CIFAR-10",
+            "role": "in-distribution evaluation",
+            "open": true,
+            "url": "https://www.cs.toronto.edu/~kriz/cifar.html"
+          },
+          {
+            "name": "CIFAR-10.1",
+            "role": "OOD evaluation",
+            "open": true,
+            "url": "https://github.com/modestyachts/CIFAR-10.1"
+          },
+          {
+            "name": "CIFAR-10.2",
+            "role": "OOD evaluation",
+            "open": true,
+            "url": "https://github.com/modestyachts/cifar-10.2"
+          },
+          {
+            "name": "CINIC-10",
+            "role": "OOD evaluation",
+            "open": true,
+            "url": "https://datashare.ed.ac.uk/handle/10283/3192"
+          }
+        ],
+        "compute": {
+          "status": "scoped_feasible",
+          "accelerator": "CPU or 1 x H200 120GB",
+          "notes": "Inference over a bounded public model collection is feasible; reproducing every model family and shift in the paper is intentionally deferred."
+        }
+      },
+      {
+        "id": "conditional-flow-matching",
+        "title": "Improving and generalizing flow-based generative models with minibatch optimal transport",
+        "paper_url": "https://arxiv.org/abs/2302.00482",
+        "pdf_url": "https://arxiv.org/pdf/2302.00482",
+        "official_repo": "https://github.com/atong01/conditional-flow-matching",
+        "source_paperbench_id": "stochastic-interpolants",
+        "selection_reason": "同样学习连接源分布和目标分布的连续概率路径，并使用 coupling 改善训练；方法和生成评测均高度相似。",
+        "planned_scope": "先复现 2D/单细胞 OT 路径结果，再在 CIFAR-10 上训练 I-CFM 与 OT-CFM 的相同小型 U-Net，报告有限 checkpoint 的 FID。",
+        "primary_artifacts": [
+          "trained flow model",
+          "single-cell trajectory interpolation model",
+          "FID",
+          "Inception Score",
+          "EMD",
+          "NPE",
+          "MMD",
+          "Recall"
+        ],
+        "datasets": [
+          {
+            "name": "CIFAR-10",
+            "role": "training/evaluation",
+            "open": true,
+            "url": "https://www.cs.toronto.edu/~kriz/cifar.html"
+          },
+          {
+            "name": "CelebA",
+            "role": "training/evaluation",
+            "open": true,
+            "url": "https://mmlab.ie.cuhk.edu.hk/projects/CelebA.html"
+          },
+          {
+            "name": "Cite",
+            "role": "training/evaluation",
+            "open": null,
+            "url": null
+          },
+          {
+            "name": "EB",
+            "role": "training/evaluation",
+            "open": null,
+            "url": null
+          },
+          {
+            "name": "Multi",
+            "role": "training/evaluation",
+            "open": null,
+            "url": null
+          }
+        ],
+        "compute": {
+          "status": "feasible_long_running",
+          "accelerator": "1 x H200 120GB",
+          "notes": "toy neural-OT 表中 CFM/RF 可在单 CPU core 训练；CIFAR-10 结果训练到 400k steps，但论文未报告该实验 GPU 型号/数量。 显存预计可满足单卡训练；400k-step CIFAR wall-clock 未报告，必须先做 1k-step benchmark 再定完整预算。 Non-GPU risks: FID 50k sampling 时间; 原论文 CIFAR compute 不透明"
+        }
+      },
+      {
+        "id": "reflexion",
+        "title": "Reflexion: Language Agents with Verbal Reinforcement Learning",
+        "paper_url": "https://arxiv.org/abs/2303.11366",
+        "pdf_url": "https://arxiv.org/pdf/2303.11366",
+        "official_repo": "https://github.com/noahshinn/reflexion",
+        "source_paperbench_id": "bbox",
+        "selection_reason": "同样把黑盒 LLM 的输出、反馈和迭代修正组合成外部适配流程，不需要更新底层模型权重，且任务与指标清晰。",
+        "planned_scope": "禁止闭源 API，使用 StarChat-beta 或同规模公开模型，在 HumanEval 子集上比较 base、self-reflection 和 episodic memory。",
+        "primary_artifacts": [
+          "Reflexion framework with episodic memory buffer",
+          "Ablation studies on feedback signals and memory",
+          "pass@1",
+          "exact match",
+          "task completion rate"
+        ],
+        "datasets": [
+          {
+            "name": "AlfWorld",
+            "role": "evaluation",
+            "open": null,
+            "url": null
+          },
+          {
+            "name": "HotPotQA",
+            "role": "evaluation",
+            "open": null,
+            "url": null
+          },
+          {
+            "name": "HumanEval",
+            "role": "evaluation",
+            "open": null,
+            "url": null
+          },
+          {
+            "name": "MBPP",
+            "role": "evaluation",
+            "open": null,
+            "url": null
+          },
+          {
+            "name": "LeetCodeHardGym",
+            "role": "evaluation",
+            "open": null,
+            "url": null
+          }
+        ],
+        "compute": {
+          "status": "scoped_feasible",
+          "accelerator": "1 x H200 120GB",
+          "notes": "论文主结果大量使用 GPT-3/3.5/4 API；同时报告 StarChat-beta 在 HumanEval 上的结果，但未给本地 GPU 型号。 约 15B 级开源模型的推理可放入 120GB；不能声称复现 GPT-4 的 91% pass@1 headline。 Non-GPU risks: 官方仓库默认 API 路径需要改成本地推理; 代码执行沙箱安全"
+        }
+      },
+      {
+        "id": "bilevel-coresets",
+        "title": "Coresets via Bilevel Optimization for Continual Learning and Streaming",
+        "paper_url": "https://arxiv.org/abs/2006.03875",
+        "pdf_url": "https://arxiv.org/pdf/2006.03875",
+        "official_repo": "https://github.com/zalanborsos/bilevel_coresets",
+        "source_paperbench_id": "lbcs",
+        "selection_reason": "同为以模型性能为目标的 coreset selection，并将选择过程写成优化问题；数据、训练、选择和结果链条完整。",
+        "planned_scope": "Implement bilevel coreset selection for continual learning on SplitMNIST and SplitCIFAR-10, compare with uniform or reservoir selection, and report accuracy, forgetting, and selection cost.",
+        "primary_artifacts": [
+          "Continual-learning accuracy table",
+          "Forgetting comparison",
+          "Coreset-selection runtime or cost"
+        ],
+        "datasets": [
+          {
+            "name": "MNIST",
+            "role": "training and evaluation",
+            "open": true,
+            "url": "https://yann.lecun.com/exdb/mnist/"
+          },
+          {
+            "name": "CIFAR-10",
+            "role": "training and evaluation",
+            "open": true,
+            "url": "https://www.cs.toronto.edu/~kriz/cifar.html"
+          }
+        ],
+        "compute": {
+          "status": "direct_feasible",
+          "accelerator": "1 x H200 120GB",
+          "notes": "The paper reports single-GPU experiments on a GTX 1080 Ti; the selected domains are much smaller than H200 memory."
+        }
+      },
+      {
+        "id": "gsm-vi",
+        "title": "Variational Inference with Gaussian Score Matching",
+        "paper_url": "https://arxiv.org/abs/2307.07849",
+        "pdf_url": "https://arxiv.org/pdf/2307.07849",
+        "official_repo": "https://github.com/modichirag/GSM-VI",
+        "source_paperbench_id": "bam",
+        "selection_reason": "这是 BaM 的直接前作和主要 baseline，同样是 Gaussian black-box VI、score matching 与闭式参数更新，复现实验可直接对齐。",
+        "planned_scope": "Implement Gaussian score-matching variational inference and compare its convergence and gradient-evaluation efficiency with black-box variational inference on a Gaussian target and one hierarchical posterior.",
+        "primary_artifacts": [
+          "Posterior-parameter error",
+          "Convergence versus gradient evaluations",
+          "Hierarchical-posterior comparison"
+        ],
+        "datasets": [
+          {
+            "name": "Synthetic Gaussian target",
+            "role": "evaluation",
+            "open": true,
+            "url": null
+          },
+          {
+            "name": "Synthetic hierarchical posterior",
+            "role": "evaluation",
+            "open": true,
+            "url": null
+          }
+        ],
+        "compute": {
+          "status": "direct_feasible",
+          "accelerator": "CPU or 1 x H200 120GB",
+          "notes": "The selected low-dimensional inference experiments are light enough to run on CPU; the H200 is more than sufficient."
+        }
+      },
+      {
+        "id": "discorl",
+        "title": "DisCoRL: Continual Reinforcement Learning via Policy Distillation",
+        "paper_url": "https://arxiv.org/abs/1907.05855",
+        "pdf_url": "https://arxiv.org/pdf/1907.05855",
+        "official_repo": "https://github.com/kalifou/robotics-rl-srl",
+        "source_paperbench_id": "ftrl",
+        "selection_reason": "直接处理 continual RL 中的灾难性遗忘，并用策略蒸馏保存旧任务能力；可将复现范围限制在论文的模拟导航实验。",
+        "planned_scope": "只复现 simulation：顺序学习三个导航任务、policy distillation 和 forgetting/retention 曲线；删除真实机器人部分。",
+        "primary_artifacts": [
+          "Performance box plots of teacher and student policies in simulation and real-life.",
+          "Comparison of distillation losses and data sampling strategies.",
+          "normalized performance",
+          "success rate"
+        ],
+        "datasets": [
+          {
+            "name": "Robotic navigation tasks",
+            "role": "training/evaluation",
+            "open": true,
+            "url": null
+          }
+        ],
+        "compute": {
+          "status": "scoped_feasible",
+          "accelerator": "1 x H200 120GB",
+          "notes": "论文未报告 GPU；包含三个模拟 2D 导航任务和真实三轮全向机器人 transfer。 模拟策略和表示模型很小，单卡足够；完整真实机器人结果不满足纯计算环境约束。 Non-GPU risks: 旧机器人模拟环境依赖; 真实机器人实验必须明确排除"
+        }
+      }
+    ]
+  }
+  
