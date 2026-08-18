@@ -134,6 +134,18 @@ def parse_args() -> argparse.Namespace:
     harbor_group.add_argument("--harbor-judge-model", default="gpt-5.5")
     harbor_group.add_argument("--harbor-timeout-sec", type=int, default=21600)
     harbor_group.add_argument(
+        "--harbor-reproduction-timeout-sec",
+        type=int,
+        default=900,
+        help="reproduce.sh verifier budget; also rendered into instruction.md",
+    )
+    harbor_group.add_argument(
+        "--harbor-judge-request-timeout-sec",
+        type=int,
+        default=600,
+        help="single LLM judge request timeout; timeout failures are not retried",
+    )
+    harbor_group.add_argument(
         "--harbor-docker-image",
         default="registry-v2.h.pjlab.org.cn/ailab-llmagent/linjiahang-p-ml:common",
     )
@@ -253,6 +265,10 @@ def main() -> None:
         args.harbor_judge_model,
         "--timeout-sec",
         str(args.harbor_timeout_sec),
+        "--reproduction-timeout-sec",
+        str(args.harbor_reproduction_timeout_sec),
+        "--judge-request-timeout-sec",
+        str(args.harbor_judge_request_timeout_sec),
         "--docker-image",
         args.harbor_docker_image,
     ]

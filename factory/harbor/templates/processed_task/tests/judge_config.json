@@ -1,0 +1,7 @@
+{
+  "judge_mode": "llm_full",
+  "code_only": false,
+  "paper_id": "example-forgetting",
+  "title": "An Empirical Study of Example Forgetting during Deep Neural Network Learning",
+  "judge_model_env": "PAPERBENCH_JUDGE_MODEL"
+}

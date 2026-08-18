@@ -15,6 +15,7 @@ import hashlib
 import json
 import re
 import shutil
+import stat
 import sys
 import tempfile
 from pathlib import Path
@@ -26,24 +27,15 @@ sys.path.insert(0, str(RUBRICS_FACTORY_DIR))
 from rubric_lib import validate_addendum, validate_rubric  # noqa: E402
 
 
-REFERENCE_BATCH = Path(
-    "/mnt/shared-storage-user/songdemin/user/yangzhixiong/agent_training/"
-    "tasks_processed/20260807-162700"
-)
+HARBOR_TEMPLATE_TASK = Path(__file__).resolve().with_name("templates") / "processed_task"
 OFFICIAL_PAPERBENCH_INSTRUCTIONS = (
-    Path(__file__).resolve().parents[4]
-    / "Bench"
-    / "PaperBench"
-    / "source"
-    / "project"
-    / "paperbench"
-    / "paperbench"
-    / "instructions"
-    / "instructions.txt"
+    Path(__file__).resolve().with_name("templates") / "instructions.official.txt"
 )
 OFFICIAL_PAPERBENCH_INSTRUCTIONS_SHA256 = (
     "712ed3968de5b8d98b96e25e7d33c95552c460649201743d8535e84c344bac56"
 )
+HARBOR_PAPER_DIR = "/workspace/paper"
+HARBOR_SUBMISSION_DIR = "/workspace/submission"
 PREFERRED_KINDS = ["json", "image", "pdf", "text", "code", "shell", "archive", "binary"]
 REQUIRED_TASK_FILES = {
     "task.toml",
@@ -129,13 +121,42 @@ def select_papers(papers: list[dict[str, Any]], requested: list[str] | None) -> 
 
 
 def default_template_task() -> Path:
-    task_root = REFERENCE_BATCH / "harbor_task"
-    candidates = sorted(path for path in task_root.glob("*") if path.is_dir())
-    if not candidates:
+    if not HARBOR_TEMPLATE_TASK.is_dir():
         raise FileNotFoundError(
-            "the reference Harbor batch is unavailable; pass --template-task explicitly"
+            f"the bundled Harbor template is unavailable: {HARBOR_TEMPLATE_TASK}"
         )
-    return candidates[0]
+    return HARBOR_TEMPLATE_TASK
+
+
+def render_harbor_instructions(path: Path, reproduction_timeout_sec: int) -> bytes:
+    raw = path.read_bytes()
+    actual_hash = sha256_bytes(raw)
+    if actual_hash != OFFICIAL_PAPERBENCH_INSTRUCTIONS_SHA256:
+        raise ValueError(
+            "instructions file is not the pinned official PaperBench instructions: "
+            f"expected {OFFICIAL_PAPERBENCH_INSTRUCTIONS_SHA256}, found {actual_hash}"
+        )
+    text = raw.decode("utf-8")
+    text = text.replace("/home/paper", HARBOR_PAPER_DIR)
+    text = text.replace("/home/submission", HARBOR_SUBMISSION_DIR)
+    old_runtime = "for a maximum runtime of 7 days."
+    minutes = reproduction_timeout_sec / 60
+    if minutes.is_integer():
+        duration = f"{reproduction_timeout_sec} seconds ({int(minutes)} minutes)"
+    else:
+        duration = f"{reproduction_timeout_sec} seconds"
+    new_runtime = (
+        f"for a maximum runtime of {duration}. Design reproduce.sh as a fast, "
+        "deterministic reproduction entry point: prioritize the scoped core evidence, "
+        "reuse committed lightweight fixtures where appropriate, and do not rely on "
+        "full-scale training or large downloads completing during grading."
+    )
+    if old_runtime not in text:
+        raise ValueError("official instructions no longer contain the expected runtime clause")
+    text = text.replace(old_runtime, new_runtime)
+    if "/home/paper" in text or "/home/submission" in text or "7 days" in text:
+        raise ValueError("failed to adapt PaperBench instructions to the Harbor runtime contract")
+    return text.encode("utf-8")
 
 
 def validate_template(template: Path) -> None:
@@ -346,6 +367,8 @@ def make_task_toml(
     pipeline_commit: str,
     judge_model: str,
     timeout_sec: int,
+    reproduction_timeout_sec: int,
+    judge_request_timeout_sec: int,
     docker_image: str,
 ) -> str:
     profile = resource_profile(metadata)
@@ -362,7 +385,7 @@ keywords = {toml_array(keywords)}
 
 [metadata]
 benchmark = "paperbench"
-source_format = "paperbench_official_style"
+source_format = "paperbench_official_style_harbor_adapted"
 paper_id = {json_string(paper_id)}
 rubric_leaf_count = {leaf_count}
 oracle_available = false
@@ -398,9 +421,9 @@ timeout_sec = {timeout_sec}
 environment_mode = "separate"
 
 [verifier.env]
-LLM_API_KEY = "${{LLM_API_KEY}}"
-LLM_BASE_URL = "${{LLM_BASE_URL}}"
 PAPERBENCH_JUDGE_MODEL = {json_string(judge_model)}
+PAPERBENCH_JUDGE_TIMEOUT_SEC = {json_string(str(judge_request_timeout_sec))}
+PAPERBENCH_REPRODUCTION_TIMEOUT_SEC = {json_string(str(reproduction_timeout_sec))}
 
 [verifier.environment]
 build_timeout_sec = 900
@@ -441,6 +464,47 @@ def copy_paper_environment(source: Path, destination: Path, addendum: Path) -> N
         (destination / "assets").mkdir()
 
 
+def normalize_task_permissions(task_dir: Path) -> None:
+    """Make generated snapshots readable and executable without world-writable files."""
+    for path in [task_dir, *task_dir.rglob("*")]:
+        if path.is_dir():
+            path.chmod(0o755)
+        elif path.is_file():
+            path.chmod(0o644)
+    for relative in (
+        "tests/test.sh",
+        "tests/llm_rubric_judge.py",
+        "solution/reproduce.sh",
+    ):
+        path = task_dir / relative
+        if path.is_file():
+            path.chmod(0o755)
+
+
+def pipeline_fingerprint(template: Path, instructions_file: Path) -> str:
+    digest = hashlib.sha256()
+    paths = [
+        ("convert_to_harbor.py", Path(__file__).resolve()),
+        ("instructions.official.txt", instructions_file),
+    ]
+    paths.extend(
+        (f"template/{relative}", template / relative)
+        for relative in (
+            "solution/README.md",
+            "solution/reproduce.sh",
+            "tests/test.sh",
+            "tests/llm_rubric_judge.py",
+            "tests/judge_config.json",
+        )
+    )
+    for label, path in paths:
+        digest.update(label.encode("utf-8"))
+        digest.update(b"\0")
+        digest.update(path.read_bytes())
+        digest.update(b"\0")
+    return digest.hexdigest()[:40]
+
+
 def build_one(
     *,
     root: Path,
@@ -453,8 +517,10 @@ def build_one(
     pipeline_commit: str,
     judge_model: str,
     timeout_sec: int,
+    reproduction_timeout_sec: int,
+    judge_request_timeout_sec: int,
     docker_image: str,
-    instructions_file: Path,
+    instructions_content: bytes,
 ) -> dict[str, Any]:
     paper_id = paper["id"]
     title = paper.get("title")
@@ -551,7 +617,7 @@ def build_one(
         ),
         encoding="utf-8",
     )
-    shutil.copy2(instructions_file, output_task_dir / "instruction.md")
+    (output_task_dir / "instruction.md").write_bytes(instructions_content)
 
     data_profile = build_data_profile(output_task_dir)
     resource_metadata = make_resource_metadata(metadata=metadata, data_profile=data_profile)
@@ -567,10 +633,13 @@ def build_one(
             pipeline_commit=pipeline_commit,
             judge_model=judge_model,
             timeout_sec=timeout_sec,
+            reproduction_timeout_sec=reproduction_timeout_sec,
+            judge_request_timeout_sec=judge_request_timeout_sec,
             docker_image=docker_image,
         ),
         encoding="utf-8",
     )
+    normalize_task_permissions(output_task_dir)
     return {
         "paper_id": paper_id,
         "rubric_source": rubric_status,
@@ -592,7 +661,7 @@ def manifest_row(
         "paper_id": paper_id,
         "promoted_public_data_paths": [],
         "removed_paths": ["environment/Dockerfile", "tests/Dockerfile"],
-        "source_format": "paperbench_official_style",
+        "source_format": "paperbench_official_style_harbor_adapted",
         "source_seed_task_id": "",
         "source_task_dir": f"agent_training/tasks/{batch_id}/{source_name}",
         "source_task_key": paper_id,
@@ -604,7 +673,7 @@ def manifest_row(
 def validate_harbor_batch(
     batch_dir: Path,
     *,
-    instructions_file: Path | None = None,
+    instructions_content: bytes | None = None,
     template_task: Path | None = None,
 ) -> dict[str, Any]:
     errors: list[str] = []
@@ -678,9 +747,17 @@ def validate_harbor_batch(
             errors.append(f"{task_id}: processed task must not contain environment/Dockerfile")
         if (task_dir / "tests" / "Dockerfile").exists():
             errors.append(f"{task_id}: processed task must not contain tests/Dockerfile")
-        if instructions_file and (task_dir / "instruction.md").is_file():
-            if (task_dir / "instruction.md").read_bytes() != instructions_file.read_bytes():
-                errors.append(f"{task_id}: instruction.md is not byte-identical to PaperBench")
+        instruction_path = task_dir / "instruction.md"
+        if instructions_content is not None and instruction_path.is_file():
+            if instruction_path.read_bytes() != instructions_content:
+                errors.append(f"{task_id}: instruction.md differs from the rendered Harbor contract")
+            instruction_text = instruction_path.read_text(encoding="utf-8")
+            for forbidden in ("/home/paper", "/home/submission", "7 days"):
+                if forbidden in instruction_text:
+                    errors.append(f"{task_id}: instruction.md contains stale contract text {forbidden!r}")
+            for required in (HARBOR_PAPER_DIR, HARBOR_SUBMISSION_DIR):
+                if required not in instruction_text:
+                    errors.append(f"{task_id}: instruction.md missing {required}")
         if template_task:
             for relative in (
                 "tests/test.sh",
@@ -705,6 +782,36 @@ def validate_harbor_batch(
             ):
                 if required_text not in toml_text:
                     errors.append(f"{task_id}: task.toml missing {required_text}")
+            for forbidden in (
+                "LLM_API_KEY",
+                "LLM_BASE_URL",
+                'JUDGE_LLM_API_KEY = "${',
+                'JUDGE_LLM_BASE_URL = "${',
+            ):
+                if forbidden in toml_text:
+                    errors.append(f"{task_id}: task.toml contains forbidden env template {forbidden!r}")
+        judge_path = task_dir / "tests" / "llm_rubric_judge.py"
+        if judge_path.is_file():
+            judge_text = judge_path.read_text(encoding="utf-8")
+            for required in (
+                'api_key = env_value("JUDGE_LLM_API_KEY")',
+                'base_url = env_value("JUDGE_LLM_BASE_URL")',
+            ):
+                if required not in judge_text:
+                    errors.append(f"{task_id}: judge is missing {required}")
+            if '"temperature"' in judge_text or "'temperature'" in judge_text:
+                errors.append(f"{task_id}: judge sends unsupported temperature")
+        for path in [task_dir, *task_dir.rglob("*")]:
+            mode = stat.S_IMODE(path.stat().st_mode)
+            expected = 0o755 if path.is_dir() or path.relative_to(task_dir).as_posix() in {
+                "tests/test.sh",
+                "tests/llm_rubric_judge.py",
+                "solution/reproduce.sh",
+            } else 0o644
+            if mode != expected:
+                errors.append(
+                    f"{task_id}: {path.relative_to(task_dir)} mode is {mode:o}, expected {expected:o}"
+                )
         metadata_path = task_dir / "resource_metadata.json"
         if metadata_path.is_file():
             resource = read_json(metadata_path)
@@ -729,12 +836,24 @@ def parse_args() -> argparse.Namespace:
         "--instructions-file",
         type=Path,
         default=OFFICIAL_PAPERBENCH_INSTRUCTIONS,
-        help="official PaperBench instructions copied byte-for-byte to instruction.md",
+        help="pinned official PaperBench instructions used as the base for Harbor path/runtime adaptation",
     )
     parser.add_argument("--require-approved", action="store_true")
     parser.add_argument("--overwrite", action="store_true")
     parser.add_argument("--judge-model", default="gpt-5.5")
     parser.add_argument("--timeout-sec", type=int, default=21600)
+    parser.add_argument(
+        "--reproduction-timeout-sec",
+        type=int,
+        default=900,
+        help="reproduce.sh verifier budget; rendered into both task.toml and instruction.md",
+    )
+    parser.add_argument(
+        "--judge-request-timeout-sec",
+        type=int,
+        default=600,
+        help="single LLM judge request timeout; the judge does not retry timeouts",
+    )
     parser.add_argument(
         "--docker-image",
         default="registry-v2.h.pjlab.org.cn/ailab-llmagent/linjiahang-p-ml:common",
@@ -758,20 +877,22 @@ def main() -> None:
     instructions_file = args.instructions_file.resolve()
     if not instructions_file.is_file():
         raise FileNotFoundError(f"PaperBench instructions file is missing: {instructions_file}")
-    actual_instructions_hash = sha256_file(instructions_file)
-    if actual_instructions_hash != OFFICIAL_PAPERBENCH_INSTRUCTIONS_SHA256:
+    if args.timeout_sec <= 0 or args.reproduction_timeout_sec <= 0 or args.judge_request_timeout_sec <= 0:
+        raise ValueError("all timeout values must be positive")
+    if args.reproduction_timeout_sec + args.judge_request_timeout_sec + 60 > args.timeout_sec:
         raise ValueError(
-            "instructions file is not the pinned official PaperBench instructions: "
-            f"expected {OFFICIAL_PAPERBENCH_INSTRUCTIONS_SHA256}, "
-            f"found {actual_instructions_hash}"
+            "--timeout-sec must leave at least 60 seconds beyond reproduction and judge request budgets"
         )
+    instructions_content = render_harbor_instructions(
+        instructions_file, args.reproduction_timeout_sec
+    )
     output_parent = args.output_parent.resolve()
     output_parent.mkdir(parents=True, exist_ok=True)
     final_dir = output_parent / batch_id
     if final_dir.exists() and not args.overwrite:
         raise FileExistsError(f"Harbor batch already exists: {final_dir}")
 
-    pipeline_commit = sha256_file(Path(__file__).resolve())[:40]
+    pipeline_commit = pipeline_fingerprint(template, instructions_file)
     with tempfile.TemporaryDirectory(prefix=f".{batch_id}-", dir=output_parent) as temporary:
         staging = Path(temporary) / batch_id
         harbor_root = staging / "harbor_task"
@@ -795,8 +916,10 @@ def main() -> None:
                 pipeline_commit=pipeline_commit,
                 judge_model=args.judge_model,
                 timeout_sec=args.timeout_sec,
+                reproduction_timeout_sec=args.reproduction_timeout_sec,
+                judge_request_timeout_sec=args.judge_request_timeout_sec,
                 docker_image=args.docker_image,
-                instructions_file=instructions_file,
+                instructions_content=instructions_content,
             )
             rows.append(
                 manifest_row(
@@ -818,7 +941,7 @@ def main() -> None:
         (staging / "manifest.jsonl").write_text(manifest_text, encoding="utf-8")
         report = validate_harbor_batch(
             staging,
-            instructions_file=instructions_file,
+            instructions_content=instructions_content,
             template_task=template,
         )
         if not report["valid"]:

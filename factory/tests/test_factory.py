@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import importlib.util
 import json
+import os
 import subprocess
 import sys
 import tempfile
@@ -12,6 +14,9 @@ FACTORY = Path(__file__).resolve().parents[1]
 FACTORY_SCRIPT = FACTORY / "build_paperbench.py"
 TASK_SCRIPT = FACTORY / "task" / "build_tasks.py"
 PUBLISH_SCRIPT = FACTORY / "rubrics" / "publish_rubric.py"
+JUDGE_TEMPLATE = (
+    FACTORY / "harbor" / "templates" / "processed_task" / "tests" / "llm_rubric_judge.py"
+)
 sys.path.insert(0, str(FACTORY / "rubrics"))
 
 from rubric_lib import validate_rubric  # noqa: E402
@@ -110,6 +115,31 @@ class RubricValidationTests(unittest.TestCase):
         self.assertFalse(report["valid"])
         self.assertTrue(any("duplicate id" in error for error in report["errors"]))
         self.assertTrue(any("internal node" in error for error in report["errors"]))
+
+
+class HarborTemplateTests(unittest.TestCase):
+    def test_submission_collection_prioritizes_core_files(self) -> None:
+        spec = importlib.util.spec_from_file_location("paperbench_judge_template", JUDGE_TEMPLATE)
+        self.assertIsNotNone(spec)
+        self.assertIsNotNone(spec.loader)
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            (root / ".git" / "objects").mkdir(parents=True)
+            for index in range(220):
+                (root / f"artifact-{index:03d}.bin").write_bytes(b"x")
+            (root / ".git" / "config").write_text("ignored", encoding="utf-8")
+            (root / "README.md").write_text("core readme", encoding="utf-8")
+            (root / "reproduce.sh").write_text("#!/bin/sh\n", encoding="utf-8")
+            (root / "src").mkdir()
+            (root / "src" / "method.py").write_text("def method(): pass\n", encoding="utf-8")
+            collected = module.collect_submission(root)
+            paths = [row["path"] for row in collected["files"]]
+            self.assertEqual(paths[:2], ["README.md", "reproduce.sh"])
+            self.assertIn("src/method.py", paths)
+            self.assertNotIn(".git/config", paths)
+            self.assertEqual(len(paths), 200)
 
 
 class EndToEndFactoryTests(unittest.TestCase):
@@ -341,21 +371,33 @@ Experiments not listed above are out of scope.
             self.assertTrue((harbor_task / "resource_metadata.json").is_file())
             self.assertTrue((harbor_task / "tests" / "rubric.json").is_file())
             self.assertTrue((harbor_task / "environment" / "paper" / "paper.pdf").is_file())
-            official_instructions = (
-                FACTORY.parents[2]
-                / "Bench"
-                / "PaperBench"
-                / "source"
-                / "project"
-                / "paperbench"
-                / "paperbench"
-                / "instructions"
-                / "instructions.txt"
+            instruction = (harbor_task / "instruction.md").read_text(encoding="utf-8")
+            self.assertIn("/workspace/paper", instruction)
+            self.assertIn("/workspace/submission", instruction)
+            self.assertIn("900 seconds (15 minutes)", instruction)
+            self.assertNotIn("/home/paper", instruction)
+            self.assertNotIn("/home/submission", instruction)
+            self.assertNotIn("7 days", instruction)
+            task_toml = (harbor_task / "task.toml").read_text(encoding="utf-8")
+            self.assertNotIn("LLM_API_KEY", task_toml)
+            self.assertNotIn("LLM_BASE_URL", task_toml)
+            self.assertIn('PAPERBENCH_REPRODUCTION_TIMEOUT_SEC = "900"', task_toml)
+            self.assertIn('PAPERBENCH_JUDGE_TIMEOUT_SEC = "600"', task_toml)
+            judge = (harbor_task / "tests" / "llm_rubric_judge.py").read_text(
+                encoding="utf-8"
             )
-            self.assertEqual(
-                (harbor_task / "instruction.md").read_bytes(),
-                official_instructions.read_bytes(),
-            )
+            self.assertIn('api_key = env_value("JUDGE_LLM_API_KEY")', judge)
+            self.assertIn('base_url = env_value("JUDGE_LLM_BASE_URL")', judge)
+            self.assertNotIn('"temperature"', judge)
+            self.assertNotIn("'temperature'", judge)
+            self.assertNotIn('"response_format"', judge)
+            self.assertIn("content = post(base_payload)", judge)
+            test_script = (harbor_task / "tests" / "test.sh").read_text(encoding="utf-8")
+            self.assertIn('PAPER_DIR="${WORKSPACE_DIR}/paper"', test_script)
+            self.assertIn('SUBMISSION_DIR="${WORKSPACE_DIR}/submission"', test_script)
+            self.assertIn('"${LOGS_DIR}/preflight.json"', test_script)
+            self.assertEqual(os.stat(harbor_task).st_mode & 0o777, 0o755)
+            self.assertEqual(os.stat(harbor_task / "tests" / "test.sh").st_mode & 0o777, 0o755)
             self.assertFalse((harbor_task / "environment" / "Dockerfile").exists())
             self.assertFalse((harbor_task / "tests" / "Dockerfile").exists())
 
