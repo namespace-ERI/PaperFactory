@@ -132,12 +132,12 @@ def parse_args() -> argparse.Namespace:
     harbor_group.add_argument("--require-approved", action="store_true")
     harbor_group.add_argument("--overwrite-harbor", action="store_true")
     harbor_group.add_argument("--harbor-judge-model", default="gpt-5.5")
-    harbor_group.add_argument("--harbor-timeout-sec", type=int, default=21600)
+    harbor_group.add_argument("--harbor-timeout-sec", type=int, default=605500)
     harbor_group.add_argument(
         "--harbor-reproduction-timeout-sec",
         type=int,
-        default=900,
-        help="reproduce.sh verifier budget; also rendered into instruction.md",
+        default=604800,
+        help="reproduce.sh verifier budget; defaults to the official PaperBench seven days",
     )
     harbor_group.add_argument(
         "--harbor-judge-request-timeout-sec",

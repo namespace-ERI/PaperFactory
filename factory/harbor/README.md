@@ -44,14 +44,14 @@ factory/harbor/templates/
 生成任务统一使用：
 
 ```text
-论文输入：/workspace/paper
-提交目录：/workspace/submission
-Artifact： /workspace/submission
-Verifier： /workspace/submission
+论文输入：/home/paper
+提交目录：/home/submission
+Artifact： /home/submission
+Verifier： /home/submission
 ```
 
-`task.toml`、`instruction.md`、`tests/test.sh` 和 manifest 会被转换器共同校验，禁止
-再次混入 `/home/paper` 或 `/home/submission`。
+`task.toml`、`instruction.md`、`tests/test.sh` 和 manifest 会被转换器共同校验，保证
+题面和实际挂载、提交、Artifact、Verifier 路径一致。
 
 ## Instruction 适配
 
@@ -61,16 +61,14 @@ Verifier： /workspace/submission
 712ed3968de5b8d98b96e25e7d33c95552c460649201743d8535e84c344bac56
 ```
 
-输出 `instruction.md` 不再声称与官方原文逐字节相同。转换器以该固定原文为输入，只做
-确定性 Harbor 协议适配：
+转换器以该固定原文为输入，输出 `instruction.md` 时只做一处确定性资源适配：
 
-1. `/home/paper` 改为 `/workspace/paper`；
-2. `/home/submission` 改为 `/workspace/submission`；
-3. “最多运行 7 天”改为实际 `reproduce.sh` verifier 时限；
-4. 明确要求快速、确定性的 reproduction，避免在 grading 阶段依赖完整训练或大下载。
+```text
+NVIDIA A10 GPU → NVIDIA H200 GPU
+```
 
-默认 reproduction 时限为 900 秒，题面会显示 `900 seconds (15 minutes)`。通过
-`--reproduction-timeout-sec` 修改时，`task.toml`、`test.sh` 运行环境和题面会同步更新。
+除 GPU 型号外，路径、任务要求和“最多运行 7 天”等官方文字逐字保持不变。默认
+`PAPERBENCH_REPRODUCTION_TIMEOUT_SEC` 为 604800 秒，与官方七天说明一致。
 
 ## Judge 环境变量
 
@@ -102,8 +100,8 @@ Judge 请求不发送 `temperature`，兼容拒绝该参数的 gpt-5.5 上游 AP
 
 `test.sh` 在 reproduction 前写出 `/logs/verifier/preflight.json`，检查：
 
-- `/workspace/paper`、PDF、Markdown 和 addendum 是否存在；
-- `/workspace/submission`、`README.md` 和 `reproduce.sh` 是否存在；
+- `/home/paper`、PDF、Markdown 和 addendum 是否存在；
+- `/home/submission`、`README.md` 和 `reproduce.sh` 是否存在；
 - judge key/base URL 是否已注入；
 - 实际 reproduction timeout。
 
@@ -112,7 +110,8 @@ Preflight 不输出任何 secret。
 ### Reproduction
 
 原始 submission 被复制到隔离执行目录，再按
-`PAPERBENCH_REPRODUCTION_TIMEOUT_SEC` 运行 `bash reproduce.sh`。默认 900 秒，与题面一致。
+`PAPERBENCH_REPRODUCTION_TIMEOUT_SEC` 运行 `bash reproduce.sh`。默认 604800 秒，与题面
+七天说明一致。
 
 ### 提交证据收集
 
@@ -139,7 +138,7 @@ python3 factory/harbor/convert_to_harbor.py \
   --paper-list factory/paperlist/20260815.json \
   --paper tent \
   --batch-id 20260818-120000 \
-  --reproduction-timeout-sec 900 \
+  --reproduction-timeout-sec 604800 \
   --judge-request-timeout-sec 600
 ```
 
@@ -157,7 +156,8 @@ draft 进入 Harbor。
 - manifest 与任务目录一一对应；
 - Harbor 文件集合完整；
 - `task.toml` 不含 secret 占位符；
-- instruction 只使用 `/workspace` 路径且时限已适配；
+- instruction 除 `A10 → H200` 外与固定官方原文完全一致；
+- task、Artifact 和 verifier 统一使用 `/home/paper`、`/home/submission`；
 - judge 只读取 `JUDGE_LLM_*` 且不发送 temperature；
 - test/judge/solution 与版本化模板一致；
 - 目录权限为 755，普通文件为 644，可执行脚本为 755；

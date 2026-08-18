@@ -397,11 +397,11 @@ Factory 在仓库中固定保存官方 PaperBench instructions 原文，其 SHA-
 712ed3968de5b8d98b96e25e7d33c95552c460649201743d8535e84c344bac56
 ```
 
-输出 `instruction.md` 会从这份固定原文确定性适配 Harbor 契约：论文和提交路径统一为
-`/workspace/paper`、`/workspace/submission`，并把官方“7 天”说明替换为实际
-reproduction verifier 时限。默认 900 秒，因此题面明确要求 15 分钟内完成快速、
-确定性的 reproduction。`task.toml` 不写入 API key/base URL 占位符；verifier 运行时由
-Harbor 安全注入 `JUDGE_LLM_API_KEY` 与 `JUDGE_LLM_BASE_URL`。
+输出 `instruction.md` 只把官方原文中的 `NVIDIA A10 GPU` 确定性替换为实际
+`NVIDIA H200 GPU`；其余文字保持不变，包括 `/home/paper`、`/home/submission` 和
+“最多运行 7 天”。Task、Artifact 和 verifier 也统一使用这套 `/home` 路径，默认
+reproduction timeout 为 604800 秒。`task.toml` 不写入 API key/base URL 占位符；
+verifier 运行时由 Harbor 安全注入 `JUDGE_LLM_API_KEY` 与 `JUDGE_LLM_BASE_URL`。
 
 Judge 模板保存在 `factory/harbor/templates/`，不再依赖可能被热修的共享参考题。它不向
 gpt-5.5 上游发送 temperature，按 README/reproduce/结果/源码优先收集提交文件，并且
@@ -440,7 +440,7 @@ python3 factory/harbor/convert_to_harbor.py \
 | `--second-model MODEL` | Rubric | 切换位置之后使用的第二模型 |
 | `--model-switch-after N` | Rubric | 前 N 篇用主模型，其余用第二模型 |
 | `--batch-id DATE` | Harbor | 设置最终日期批次目录名 |
-| `--harbor-reproduction-timeout-sec N` | Harbor | `reproduce.sh` verifier 时限，同时写入题面，默认 900 |
+| `--harbor-reproduction-timeout-sec N` | Harbor | `reproduce.sh` verifier 时限，默认 604800（7 天） |
 | `--harbor-judge-request-timeout-sec N` | Harbor | 单次 judge 请求时限，默认 600；超时不盲重试 |
 | `--require-approved` | Harbor | 禁止未人工批准的 draft 进入批次 |
 | `--overwrite-harbor` | Harbor | 替换同名的未完成或旧批次 |
@@ -565,6 +565,7 @@ python3 factory/rubrics/validate_rubric.py --paper tent --packages
 - `manifest.jsonl` 行数等于 `harbor_task/` 子目录数；
 - 每个 manifest `paper_id` 都来自本次明确选择的论文；
 - 每题所需环境、tests 和 solution 文件齐全；
-- 每份 `instruction.md` 都由固定官方原文确定性适配，且只使用 `/workspace` 路径；
+- 每份 `instruction.md` 除 `A10 → H200` 外都与固定官方原文一致；
+- task、Artifact、instruction 和 verifier 路径统一为 `/home/paper`、`/home/submission`；
 - `task.toml` 不含 LLM/JUDGE secret 占位符，judge 只读取运行时注入的 `JUDGE_LLM_*`；
 - 正式发布批次全部通过 `--require-approved`。

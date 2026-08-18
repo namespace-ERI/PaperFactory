@@ -372,16 +372,24 @@ Experiments not listed above are out of scope.
             self.assertTrue((harbor_task / "tests" / "rubric.json").is_file())
             self.assertTrue((harbor_task / "environment" / "paper" / "paper.pdf").is_file())
             instruction = (harbor_task / "instruction.md").read_text(encoding="utf-8")
-            self.assertIn("/workspace/paper", instruction)
-            self.assertIn("/workspace/submission", instruction)
-            self.assertIn("900 seconds (15 minutes)", instruction)
-            self.assertNotIn("/home/paper", instruction)
-            self.assertNotIn("/home/submission", instruction)
-            self.assertNotIn("7 days", instruction)
+            official_instruction = (
+                FACTORY / "harbor" / "templates" / "instructions.official.txt"
+            ).read_text(encoding="utf-8")
+            self.assertEqual(
+                instruction,
+                official_instruction.replace("NVIDIA A10 GPU", "NVIDIA H200 GPU"),
+            )
+            self.assertIn("/home/paper", instruction)
+            self.assertIn("/home/submission", instruction)
+            self.assertIn("for a maximum runtime of 7 days", instruction)
+            self.assertIn("NVIDIA H200 GPU", instruction)
+            self.assertNotIn("NVIDIA A10 GPU", instruction)
             task_toml = (harbor_task / "task.toml").read_text(encoding="utf-8")
             self.assertNotIn("LLM_API_KEY", task_toml)
             self.assertNotIn("LLM_BASE_URL", task_toml)
-            self.assertIn('PAPERBENCH_REPRODUCTION_TIMEOUT_SEC = "900"', task_toml)
+            self.assertIn('artifacts = ["/home/submission"]', task_toml)
+            self.assertIn('workdir = "/home"', task_toml)
+            self.assertIn('PAPERBENCH_REPRODUCTION_TIMEOUT_SEC = "604800"', task_toml)
             self.assertIn('PAPERBENCH_JUDGE_TIMEOUT_SEC = "600"', task_toml)
             judge = (harbor_task / "tests" / "llm_rubric_judge.py").read_text(
                 encoding="utf-8"
@@ -393,6 +401,7 @@ Experiments not listed above are out of scope.
             self.assertNotIn('"response_format"', judge)
             self.assertIn("content = post(base_payload)", judge)
             test_script = (harbor_task / "tests" / "test.sh").read_text(encoding="utf-8")
+            self.assertIn('WORKSPACE_DIR="${HARBOR_WORKSPACE_DIR:-/home}"', test_script)
             self.assertIn('PAPER_DIR="${WORKSPACE_DIR}/paper"', test_script)
             self.assertIn('SUBMISSION_DIR="${WORKSPACE_DIR}/submission"', test_script)
             self.assertIn('"${LOGS_DIR}/preflight.json"', test_script)

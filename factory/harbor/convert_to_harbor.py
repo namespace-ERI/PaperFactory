@@ -34,8 +34,9 @@ OFFICIAL_PAPERBENCH_INSTRUCTIONS = (
 OFFICIAL_PAPERBENCH_INSTRUCTIONS_SHA256 = (
     "712ed3968de5b8d98b96e25e7d33c95552c460649201743d8535e84c344bac56"
 )
-HARBOR_PAPER_DIR = "/workspace/paper"
-HARBOR_SUBMISSION_DIR = "/workspace/submission"
+HARBOR_WORKDIR = "/home"
+HARBOR_PAPER_DIR = "/home/paper"
+HARBOR_SUBMISSION_DIR = "/home/submission"
 PREFERRED_KINDS = ["json", "image", "pdf", "text", "code", "shell", "archive", "binary"]
 REQUIRED_TASK_FILES = {
     "task.toml",
@@ -128,7 +129,7 @@ def default_template_task() -> Path:
     return HARBOR_TEMPLATE_TASK
 
 
-def render_harbor_instructions(path: Path, reproduction_timeout_sec: int) -> bytes:
+def render_harbor_instructions(path: Path) -> bytes:
     raw = path.read_bytes()
     actual_hash = sha256_bytes(raw)
     if actual_hash != OFFICIAL_PAPERBENCH_INSTRUCTIONS_SHA256:
@@ -137,25 +138,12 @@ def render_harbor_instructions(path: Path, reproduction_timeout_sec: int) -> byt
             f"expected {OFFICIAL_PAPERBENCH_INSTRUCTIONS_SHA256}, found {actual_hash}"
         )
     text = raw.decode("utf-8")
-    text = text.replace("/home/paper", HARBOR_PAPER_DIR)
-    text = text.replace("/home/submission", HARBOR_SUBMISSION_DIR)
-    old_runtime = "for a maximum runtime of 7 days."
-    minutes = reproduction_timeout_sec / 60
-    if minutes.is_integer():
-        duration = f"{reproduction_timeout_sec} seconds ({int(minutes)} minutes)"
-    else:
-        duration = f"{reproduction_timeout_sec} seconds"
-    new_runtime = (
-        f"for a maximum runtime of {duration}. Design reproduce.sh as a fast, "
-        "deterministic reproduction entry point: prioritize the scoped core evidence, "
-        "reuse committed lightweight fixtures where appropriate, and do not rely on "
-        "full-scale training or large downloads completing during grading."
-    )
-    if old_runtime not in text:
-        raise ValueError("official instructions no longer contain the expected runtime clause")
-    text = text.replace(old_runtime, new_runtime)
-    if "/home/paper" in text or "/home/submission" in text or "7 days" in text:
-        raise ValueError("failed to adapt PaperBench instructions to the Harbor runtime contract")
+    old_gpu = "NVIDIA A10 GPU"
+    if text.count(old_gpu) != 1:
+        raise ValueError("official instructions no longer contain exactly one A10 GPU clause")
+    text = text.replace(old_gpu, "NVIDIA H200 GPU")
+    if "NVIDIA A10 GPU" in text or "NVIDIA H200 GPU" not in text:
+        raise ValueError("failed to adapt PaperBench instructions to the H200 runtime")
     return text.encode("utf-8")
 
 
@@ -376,7 +364,7 @@ def make_task_toml(
     estimate = resource_metadata["resource_estimate"]
     keywords = sorted({paper_id, "paper-reproduction", "paperbench", "research"})
     return f'''schema_version = "1.4"
-artifacts = ["/workspace/submission"]
+artifacts = [{json_string(HARBOR_SUBMISSION_DIR)}]
 
 [task]
 name = {json_string(f"mlcoding/{task_id}")}
@@ -445,7 +433,7 @@ memory_mb = 8192
 storage_mb = 16384
 gpus = {profile["rollout_gpus"]}
 docker_image = {json_string(docker_image)}
-workdir = "/workspace"
+workdir = {json_string(HARBOR_WORKDIR)}
 '''
 
 
@@ -654,7 +642,7 @@ def manifest_row(
 ) -> dict[str, Any]:
     source_name = f"paperbench-{source_index:04d}"
     return {
-        "artifact_paths": ["/workspace/submission"],
+        "artifact_paths": [HARBOR_SUBMISSION_DIR],
         "benchmark": "paperbench",
         "competition_id": "",
         "metric": "llm_rubric_judge",
@@ -752,12 +740,13 @@ def validate_harbor_batch(
             if instruction_path.read_bytes() != instructions_content:
                 errors.append(f"{task_id}: instruction.md differs from the rendered Harbor contract")
             instruction_text = instruction_path.read_text(encoding="utf-8")
-            for forbidden in ("/home/paper", "/home/submission", "7 days"):
-                if forbidden in instruction_text:
-                    errors.append(f"{task_id}: instruction.md contains stale contract text {forbidden!r}")
             for required in (HARBOR_PAPER_DIR, HARBOR_SUBMISSION_DIR):
                 if required not in instruction_text:
                     errors.append(f"{task_id}: instruction.md missing {required}")
+            if "for a maximum runtime of 7 days" not in instruction_text:
+                errors.append(f"{task_id}: instruction.md changed the official seven-day runtime")
+            if "NVIDIA H200 GPU" not in instruction_text or "NVIDIA A10 GPU" in instruction_text:
+                errors.append(f"{task_id}: instruction.md does not contain the H200-only GPU adaptation")
         if template_task:
             for relative in (
                 "tests/test.sh",
@@ -773,12 +762,12 @@ def validate_harbor_batch(
             toml_text = task_toml.read_text(encoding="utf-8")
             for required_text in (
                 'schema_version = "1.4"',
-                'artifacts = ["/workspace/submission"]',
+                f'artifacts = [{json_string(HARBOR_SUBMISSION_DIR)}]',
                 f'paper_id = {json_string(str(row.get("paper_id", "")))}',
                 'scoring_method = "llm_rubric_judge"',
                 'environment_mode = "separate"',
                 'workdir = "/tests"',
-                'workdir = "/workspace"',
+                f'workdir = {json_string(HARBOR_WORKDIR)}',
             ):
                 if required_text not in toml_text:
                     errors.append(f"{task_id}: task.toml missing {required_text}")
@@ -841,12 +830,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--require-approved", action="store_true")
     parser.add_argument("--overwrite", action="store_true")
     parser.add_argument("--judge-model", default="gpt-5.5")
-    parser.add_argument("--timeout-sec", type=int, default=21600)
+    parser.add_argument("--timeout-sec", type=int, default=605500)
     parser.add_argument(
         "--reproduction-timeout-sec",
         type=int,
-        default=900,
-        help="reproduce.sh verifier budget; rendered into both task.toml and instruction.md",
+        default=604800,
+        help="reproduce.sh verifier budget; defaults to the official PaperBench seven days",
     )
     parser.add_argument(
         "--judge-request-timeout-sec",
@@ -883,9 +872,7 @@ def main() -> None:
         raise ValueError(
             "--timeout-sec must leave at least 60 seconds beyond reproduction and judge request budgets"
         )
-    instructions_content = render_harbor_instructions(
-        instructions_file, args.reproduction_timeout_sec
-    )
+    instructions_content = render_harbor_instructions(instructions_file)
     output_parent = args.output_parent.resolve()
     output_parent.mkdir(parents=True, exist_ok=True)
     final_dir = output_parent / batch_id
