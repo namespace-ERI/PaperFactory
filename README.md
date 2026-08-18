@@ -1,5 +1,11 @@
 # PaperFactory
 
+中文文档入口：
+
+- [完整 Factory 管线](factory/README.md)
+- [Rubric 生成中文说明](factory/rubrics/README.zh-CN.md)
+- [Rubric 制作规范](factory/rubrics/RUBRIC_CREATION_GUIDE_ZH.md)
+
 PaperFactory 将已经选好的论文列表依次转换为：
 
 1. PaperBench 论文 task 输入包；
@@ -21,8 +27,8 @@ python3 factory/build_paperbench.py \
 
 完整的输入格式、目录契约、URL-only 支持、并发与模型切换、rubric 显式构树流程、
 人工发布门槛、Harbor 转换和当前批次统计，见
-[factory/README.md](factory/README.md)。Rubric 制作规范见
-[factory/rubrics/RUBRIC_CREATION_GUIDE_ZH.md](factory/rubrics/RUBRIC_CREATION_GUIDE_ZH.md)。
+[factory/README.md](factory/README.md)。Rubric 子流水线的独立说明见
+[factory/rubrics/README.zh-CN.md](factory/rubrics/README.zh-CN.md)。
 
 ## 安装与测试
 

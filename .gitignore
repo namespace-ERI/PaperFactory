@@ -3,6 +3,7 @@
 /design/
 /papers/
 /splits/
+/rubric_packages/
 
 # Local runtime bundles and legacy staging utilities are not part of PaperFactory.
 /environment/
@@ -28,4 +29,3 @@ __pycache__/
 !.env.example
 .venv/
 venv/
-
