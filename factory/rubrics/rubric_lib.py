@@ -19,6 +19,8 @@ REQUIRED_FIELDS = {
     "finegrained_task_category",
 }
 TASK_CATEGORIES = {"Code Development", "Code Execution", "Result Analysis"}
+RUBRIC_MODES = {"regular", "code-dev"}
+CODE_DEV_DERIVATION = "official-code-development-prune-v1"
 FINEGRAINED_CATEGORIES = {
     "Environment & Infrastructure Setup",
     "Dataset and Model Acquisition",
@@ -63,7 +65,42 @@ def normalize_rubric(raw: dict[str, Any]) -> dict[str, Any]:
     }
 
 
-def validate_rubric(raw: Any) -> dict[str, Any]:
+def paperbench_code_only_rubric(raw: dict[str, Any]) -> dict[str, Any]:
+    """Return the official PaperBench Code-Dev view of a complete rubric tree.
+
+    This mirrors ``TaskNode.code_only()`` / ``reduce_to_category``: retain only
+    Code Development leaves, retain exactly the ancestors that still have a
+    retained descendant, and preserve every retained node's original local
+    weight.  Scoring then naturally renormalizes the remaining siblings at
+    each level.  The root fallback matches PaperBench's behavior for a rubric
+    with no Code Development leaf.
+    """
+    tree = normalize_rubric(raw)
+
+    def prune(node: dict[str, Any]) -> dict[str, Any] | None:
+        children = node["sub_tasks"]
+        if not children:
+            return node if node.get("task_category") == "Code Development" else None
+        retained = [child for child in (prune(value) for value in children) if child]
+        if not retained:
+            return None
+        # TaskNode.set_sub_tasks() clears task_category whenever children
+        # remain.  Preserve the other fields and original local weight.
+        return {**node, "sub_tasks": retained, "task_category": None}
+
+    pruned = prune(tree)
+    if pruned is not None:
+        return pruned
+    return {
+        **tree,
+        "sub_tasks": [],
+        "task_category": "Code Development",
+    }
+
+
+def validate_rubric(raw: Any, *, rubric_mode: str = "regular") -> dict[str, Any]:
+    if rubric_mode not in RUBRIC_MODES:
+        raise ValueError(f"unsupported rubric mode: {rubric_mode!r}")
     errors: list[str] = []
     warnings: list[str] = []
     seen: set[str] = set()
@@ -190,6 +227,17 @@ def validate_rubric(raw: Any) -> dict[str, Any]:
     for category, count in categories.items():
         if count == 0:
             warnings.append(f"rubric contains no {category} leaves")
+    if rubric_mode == "code-dev":
+        non_code_leaves = [
+            leaf.get("id")
+            for leaf in leaves
+            if leaf.get("task_category") != "Code Development"
+        ]
+        if non_code_leaves:
+            errors.append(
+                "code-dev rubric contains non-Code Development leaves: "
+                + ", ".join(str(node_id) for node_id in non_code_leaves[:20])
+            )
     if max_depth > 9:
         warnings.append(f"tree depth {max_depth} exceeds the usual PaperBench range (up to 9)")
     if raw.get("weight") != 1:
@@ -209,6 +257,7 @@ def validate_rubric(raw: Any) -> dict[str, Any]:
         "errors": errors,
         "warnings": warnings,
         "stats": {
+            "rubric_mode": rubric_mode,
             "nodes": node_count,
             "leaves": len(leaves),
             "max_depth": max_depth,
@@ -246,7 +295,7 @@ def validate_addendum(text: str) -> dict[str, Any]:
     return {"valid": not errors, "errors": errors, "warnings": warnings}
 
 
-def validate_package(paper_dir: Path) -> dict[str, Any]:
+def validate_package(paper_dir: Path, *, rubric_mode: str = "regular") -> dict[str, Any]:
     errors: list[str] = []
     warnings: list[str] = []
     for name in ("config.yaml", "paper.pdf", "paper.md", "blacklist.txt", "rubric.json", "addendum.md"):
@@ -256,7 +305,9 @@ def validate_package(paper_dir: Path) -> dict[str, Any]:
     addendum_report: dict[str, Any] = {}
     if (paper_dir / "rubric.json").is_file():
         try:
-            rubric_report = validate_rubric(load_json(paper_dir / "rubric.json"))
+            rubric_report = validate_rubric(
+                load_json(paper_dir / "rubric.json"), rubric_mode=rubric_mode
+            )
             errors.extend(f"rubric: {value}" for value in rubric_report["errors"])
             warnings.extend(f"rubric: {value}" for value in rubric_report["warnings"])
         except (OSError, json.JSONDecodeError) as exc:

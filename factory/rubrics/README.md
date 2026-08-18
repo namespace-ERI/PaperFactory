@@ -11,6 +11,10 @@ rubric**。树规划、各分支展开、确定性组装、独立配权、权重
 模型产物默认是 `draft-needs-human-review`。自动校验通过只说明 JSON 树结构合法，
 不代表 rubric 已经过 gold run、领域专家审核或正式批准。
 
+支持 `--rubric-mode regular|code-dev`。默认 `regular`；`code-dev` 先完成正常的完整构树和
+局部配权，再按官方 `TaskNode.code_only()` 确定性保留 `Code Development` 叶节点及其祖先，
+不执行代码、不要求运行结果，也不会为剪枝后的树重新配权。
+
 ## 1. 输入、输出与可见性边界
 
 每篇论文至少需要以下输入：
@@ -69,6 +73,16 @@ flowchart TD
     X --> Y
     Y --> Z["rubric.draft.json、validation、provenance"]
 ```
+
+### 2.0 模式边界
+
+- `regular`：允许 Code Development、Code Execution、Result Analysis 三类叶节点；
+- `code-dev`：完整树配权后删除 Execution/Result 叶节点及空祖先，只评估论文复现所需
+  代码是否正确实现。
+
+Code-dev 保留完整树中存活节点的 ID、requirements 和局部权重；最终输出
+`rubric.draft.json` 只含 Code Development，完整树另存为 `rubric.full.draft.json`。评分时
+剩余兄弟逐层重新归一化，与官方 `reduce_to_category` + `score_from_children` 一致。
 
 ### 2.1 论文元素抽取
 

@@ -11,6 +11,10 @@ rubric**。树规划、各分支展开、确定性组装、独立配权、权重
 模型产物默认是 `draft-needs-human-review`。自动校验通过只说明 JSON 树结构合法，
 不代表 rubric 已经过 gold run、领域专家审核或正式批准。
 
+Rubric 有两种生成模式：`regular`（默认）和 `code-dev`。两种模式都先执行完整的显式
+构树和局部配权。`code-dev` 随后按官方 `TaskNode.code_only()` 做确定性树剪枝，而不是另造
+一棵实现树或重新配权。
+
 ## 1. 输入、输出与可见性边界
 
 每篇论文至少需要以下输入：
@@ -55,11 +59,18 @@ flowchart TD
     M --> N["独立审计并规划局部权重"]
     N --> O["rubric_weight_plan.json"]
     O --> P["按 node ID 确定性应用权重"]
-    P --> Q["自动结构校验"]
+    P --> Q["完整树自动结构校验"]
     Q -- "有结构错误" --> R["有限轮结构修复"]
     R --> S["重新应用原权重计划并复验"]
-    Q -- "结构合法" --> T["独立质量审查"]
-    S --> T
+    Q -- "结构合法" --> S0["确认完整树与权重"]
+    S --> D{"code-dev？"}
+    S0 --> D
+    D -- "是" --> D1["保存 rubric.full.draft.json"]
+    D1 --> D2["按官方规则剪枝到 Code Development"]
+    D -- "否" --> D3["保持完整树"]
+    D2 --> Q2["校验最终 rubric 视图"]
+    D3 --> Q2
+    Q2 --> T["独立质量审查"]
     T --> U["quality_review.json"]
     T --> V{"需要 judge-only 澄清？"}
     V -- "是" --> W["judge.addendum.draft.md"]
@@ -69,6 +80,18 @@ flowchart TD
     X --> Y
     Y --> Z["rubric.draft.json、validation、provenance"]
 ```
+
+### 2.0 模式边界
+
+- `regular`：允许官方三类叶节点，即 `Code Development`、`Code Execution`、
+  `Result Analysis`。
+- `code-dev`：完整树配权后，确定性保留 `Code Development` 叶节点及其祖先；不要求代码
+  真实执行，不要求 `reproduce.sh`、运行日志、生成指标或复现结果。
+
+剪枝完全复刻官方 `reduce_to_category`：删除 Execution/Result 叶节点，删除没有保留后代的
+内部节点，保留其余节点的 ID、requirements 和原局部权重；不会针对 code-dev 再做一次
+配权。最终 `rubric.draft.json` 只含 Code Development，完整来源树保存在
+`rubric.full.draft.json`。评分时各层剩余兄弟按官方递归公式重新归一化。
 
 ### 2.1 论文元素抽取
 
@@ -277,7 +300,18 @@ python3 factory/rubrics/create_rubrics.py \
   --model your-model \
   --base-url https://your-openai-compatible-endpoint/v1 \
   --workers 3 \
+  --rubric-mode regular \
   --target-leaves 40-120
+```
+
+只生成 code-development rubric：
+
+```bash
+python3 factory/rubrics/create_rubrics.py \
+  --root /root/workspace/Task/PaperBench \
+  --paper tent \
+  --model your-model \
+  --rubric-mode code-dev
 ```
 
 密钥只通过环境变量传递，不能写入命令、paper list、日志或仓库。
@@ -345,6 +379,7 @@ python3 factory/rubrics/create_rubrics.py \
 | `--workers` | 3 | 单篇内部并发 |
 | `--paper-workers` | 1 | 论文级并发 |
 | `--target-leaves` | 40-120 | 原子叶节点粒度目标 |
+| `--rubric-mode` | regular | `regular` 或仅评实现的 `code-dev` |
 | `--repair-rounds` | 1 | 自动结构修复上限 |
 | `--max-completion-tokens` | 24000 | 单次模型输出上限 |
 | `--timeout` | 300 | 单请求超时秒数 |
@@ -387,6 +422,7 @@ Factory 端到端测试使用该机制验证显式构树顺序、目录产物和
 ```bash
 python3 factory/rubrics/validate_rubric.py \
   design/tent/rubric_authoring/rubric.draft.json \
+  --rubric-mode code-dev \
   --report design/tent/rubric_authoring/validation_report.manual.json
 ```
 

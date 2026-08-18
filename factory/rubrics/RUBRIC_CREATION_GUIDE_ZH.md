@@ -692,6 +692,23 @@ title: "Full Paper Title"
 
 ## 7. 发布前检查清单
 
+### 7.0 Code-dev 模式
+
+当生产管线选择 `code-dev` 时，先按常规模式完成完整树的显式构造和局部配权，再遵循
+官方 `TaskNode.code_only()` / `reduce_to_category` 做确定性剪枝：只评估完成论文复现所需
+的代码是否正确实现，不评估代码是否实际运行，也不评估生成结果是否复现论文结论。
+
+- 完整来源树仍可包含三类叶节点，并保存为 `rubric.full.draft.json`；
+- 最终 code-dev 树的所有叶节点必须为 `Code Development`；
+- 删除 `Code Execution`、`Result Analysis` 叶节点及没有保留后代的内部节点；
+- 保留所有存活节点原有 ID、requirements 和局部权重，禁止为 code-dev 重新配权；
+- 不得要求 `reproduce.sh` 被调用、日志存在、指标生成或结果趋势成立；
+- 仍按科研贡献规划顶层树，并递归拆解为单一、可观察、可二元判断的实现条件；
+- 内部节点、唯一 ID、局部兄弟权重、有效权重和递归聚合规则与常规模式完全相同；
+- README 自述不能替代具体源代码证据。
+
+以下“结果”检查清单仅适用于常规模式；code-dev 审核应确认相关要求没有进入 rubric。
+
 ### 7.1 范围
 
 - [ ] 核心贡献均有覆盖；

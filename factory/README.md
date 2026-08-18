@@ -8,6 +8,10 @@ rubric，最后生成与 processed Harbor 数据一致的任务批次。总入�
 task 构造 → task 完整性检查 → rubric/addendum 构造 → Harbor 转换
 ```
 
+整条管线支持 `--rubric-mode regular|code-dev`。默认 `regular`；`code-dev` 先按 regular
+模式生成并配权完整树，再按官方 `TaskNode.code_only()` 规则确定性剪枝，最终只评分
+`Code Development` 叶节点。
+
 Rubric 生成的是可审计初稿。初稿能够用于 Harbor 格式联调，但正式发布仍必须经过
 gold run、领域专家复核、问题清零和人工批准。
 
@@ -123,9 +127,21 @@ python3 factory/build_paperbench.py \
   --paper-list factory/paperlist/20260815.json \
   --model gpt-5.5-high \
   --base-url http://your-openai-compatible-endpoint/v1 \
+  --rubric-mode regular \
   --task-workers 4 \
   --paper-workers 4 \
   --workers 2 \
+  --batch-id 20260817-120000
+```
+
+生成只评代码实现、不执行实验的任务时，把同一条命令改为：
+
+```bash
+python3 factory/build_paperbench.py \
+  --paper-list factory/paperlist/20260815.json \
+  --model gpt-5.5-high \
+  --base-url http://your-openai-compatible-endpoint/v1 \
+  --rubric-mode code-dev \
   --batch-id 20260817-120000
 ```
 
@@ -263,7 +279,19 @@ flowchart TD
 10. **落盘审计轨迹**：汇总 unresolved questions、校验报告、生成模型、输入哈希、
     guide 哈希和构树阶段，最终状态固定为 `draft-needs-human-review`。
 
-### 6.2 树节点与权重语义
+### 6.2 Rubric 模式
+
+- `regular`（默认）：按论文需要分别构造 `Code Development`、`Code Execution` 和
+  `Result Analysis` 叶节点，执行 `reproduce.sh` 后综合代码、日志和结果评分。
+- `code-dev`：先构造与配权完整三类树，再删除非 `Code Development` 叶节点和因此变空的
+  祖先；保留节点 ID、祖先结构和原局部权重，不为 code-dev 另行配权。评分时剩余兄弟按
+  官方递归公式自然重新归一化。Harbor 使用官方 code-only instruction，不要求
+  `reproduce.sh`，也不检查运行结果或论文趋势。
+
+模式会写入 `authoring_provenance.json`、`judge_config.json` 和 `task.toml`。已有完整草稿
+不能用 `--resume-rubric` 切换模式；需要显式 `--overwrite-rubric` 重新生成。
+
+### 6.3 树节点与权重语义
 
 每个节点严格包含：
 
@@ -403,9 +431,20 @@ Factory 在仓库中固定保存官方 PaperBench instructions 原文，其 SHA-
 reproduction timeout 为 604800 秒。`task.toml` 不写入 API key/base URL 占位符；
 verifier 运行时由 Harbor 安全注入 `JUDGE_LLM_API_KEY` 与 `JUDGE_LLM_BASE_URL`。
 
+公共 processed Harbor 字段与当前 `native_rollout_task_v1` 参考格式对齐：metadata 同时写入
+`source_native_contract`、`construction_format`、`native_task_id`、
+`reference_solution_available` 和 `gpu_count`；`resource_metadata.json` 使用
+`harbor_resource_metadata_v3`。Agent 与 verifier 环境都声明 `gpus = 1` 和
+`gpu_types = ["H200"]`，并由转换后的自动校验检查 TOML、resource metadata 与题面中的
+H200 资源声明一致。PaperBench 专属路径、联网方式和 LLM rubric judge 不会被 MLS 值覆盖。
+
 Judge 模板保存在 `factory/harbor/templates/`，不再依赖可能被热修的共享参考题。它不向
 gpt-5.5 上游发送 temperature，按 README/reproduce/结果/源码优先收集提交文件，并且
-超时后不会无条件重发同一个大请求。详细契约见
+超时后不会无条件重发同一个大请求。叶节点严格二元评分（0 或 1），总分按 rubric 树
+逐层使用兄弟节点局部权重递归聚合，不会把叶子权重误当成全局权重。Verifier 还会检查
+submission 是以自身为根且含 HEAD 的 Git 仓库、所有 tracked 修改已提交、README 和
+reproduce.sh 已提交、HEAD 中 committed files 总量不超过 1GB；随后对隔离副本执行
+`git clean -fd`，只把清理后的副本交给 judge。详细契约见
 [`factory/harbor/README.md`](harbor/README.md)。
 
 单独转换已有 task 和 rubric：
@@ -419,8 +458,9 @@ python3 factory/harbor/convert_to_harbor.py \
   --output-parent /root/workspace/Task/PaperBench/papers
 ```
 
-默认优先使用已经发布的 `paper_sources/<id>/rubric.json` 和 `addendum.md`；不存在时
-会使用 authoring draft，方便格式联调。正式数据集转换必须增加 `--require-approved`。
+默认优先使用与 `--rubric-mode` 一致的已发布 `rubric.json` 和 `addendum.md`；不存在
+同模式发布版本时会使用同模式 authoring draft，方便格式联调。正式数据集转换必须增加
+`--require-approved`。
 相同批次目录默认拒绝覆盖，只有显式 `--overwrite` 才会替换。
 
 ## 9. 中断恢复与常用参数
@@ -431,6 +471,7 @@ python3 factory/harbor/convert_to_harbor.py \
 | `--offline` | Task | 禁止联网，只使用本地输入 |
 | `--force-task` | Task | 重建已存在的 task 包 |
 | `--task-workers N` | Task | 同时下载、转换多少篇论文，默认 4 |
+| `--rubric-mode MODE` | Rubric/Harbor | `regular`（默认）或只评代码实现的 `code-dev` |
 | `--paper-workers N` | Rubric | 同时制作多少篇 rubric，默认 1 |
 | `--workers N` | Rubric | 单篇内部的 chunk/子树并发，默认 3 |
 | `--target-leaves 40-120` | Rubric | 原子叶节点粒度目标，不机械凑数 |
@@ -441,7 +482,8 @@ python3 factory/harbor/convert_to_harbor.py \
 | `--model-switch-after N` | Rubric | 前 N 篇用主模型，其余用第二模型 |
 | `--batch-id DATE` | Harbor | 设置最终日期批次目录名 |
 | `--harbor-reproduction-timeout-sec N` | Harbor | `reproduce.sh` verifier 时限，默认 604800（7 天） |
-| `--harbor-judge-request-timeout-sec N` | Harbor | 单次 judge 请求时限，默认 600；超时不盲重试 |
+| `--harbor-judge-request-timeout-sec N` | Harbor | 单个 leaf judge 请求时限，默认 600；超时不盲重试 |
+| `--harbor-judge-max-workers N` | Harbor | leaf judge 最大并发数，默认 100；单 leaf 失败不影响其他 leaf |
 | `--require-approved` | Harbor | 禁止未人工批准的 draft 进入批次 |
 | `--overwrite-harbor` | Harbor | 替换同名的未完成或旧批次 |
 
@@ -568,4 +610,6 @@ python3 factory/rubrics/validate_rubric.py --paper tent --packages
 - 每份 `instruction.md` 除 `A10 → H200` 外都与固定官方原文一致；
 - task、Artifact、instruction 和 verifier 路径统一为 `/home/paper`、`/home/submission`；
 - `task.toml` 不含 LLM/JUDGE secret 占位符，judge 只读取运行时注入的 `JUDGE_LLM_*`；
+- verifier 检查 Git/HEAD/已提交状态/1GB 上限并对评分副本执行 `git clean -fd`；
+- judge 只接受叶节点 0/1，并按树逐层递归聚合兄弟节点局部权重；
 - 正式发布批次全部通过 `--require-approved`。

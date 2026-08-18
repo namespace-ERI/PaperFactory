@@ -84,6 +84,12 @@ def parse_args() -> argparse.Namespace:
     task_group.add_argument("--split-name")
 
     rubric_group = parser.add_argument_group("rubric stage")
+    rubric_group.add_argument(
+        "--rubric-mode",
+        choices=("regular", "code-dev"),
+        default="regular",
+        help="regular grades implementation/execution/results; code-dev grades implementation only",
+    )
     rubric_group.add_argument("--guide", type=Path)
     rubric_group.add_argument("--model")
     rubric_group.add_argument(
@@ -132,7 +138,7 @@ def parse_args() -> argparse.Namespace:
     harbor_group.add_argument("--require-approved", action="store_true")
     harbor_group.add_argument("--overwrite-harbor", action="store_true")
     harbor_group.add_argument("--harbor-judge-model", default="gpt-5.5")
-    harbor_group.add_argument("--harbor-timeout-sec", type=int, default=605500)
+    harbor_group.add_argument("--harbor-timeout-sec", type=int, default=606100)
     harbor_group.add_argument(
         "--harbor-reproduction-timeout-sec",
         type=int,
@@ -144,6 +150,12 @@ def parse_args() -> argparse.Namespace:
         type=int,
         default=600,
         help="single LLM judge request timeout; timeout failures are not retried",
+    )
+    harbor_group.add_argument(
+        "--harbor-judge-max-workers",
+        type=int,
+        default=100,
+        help="maximum concurrent per-leaf judge requests; defaults to official PaperBench's 100",
     )
     harbor_group.add_argument(
         "--harbor-docker-image",
@@ -208,6 +220,8 @@ def main() -> None:
         str(args.paper_workers),
         "--target-leaves",
         args.target_leaves,
+        "--rubric-mode",
+        args.rubric_mode,
         "--repair-rounds",
         str(args.repair_rounds),
         "--max-completion-tokens",
@@ -269,8 +283,12 @@ def main() -> None:
         str(args.harbor_reproduction_timeout_sec),
         "--judge-request-timeout-sec",
         str(args.harbor_judge_request_timeout_sec),
+        "--judge-max-workers",
+        str(args.harbor_judge_max_workers),
         "--docker-image",
         args.harbor_docker_image,
+        "--rubric-mode",
+        args.rubric_mode,
     ]
     for paper_id in paper_ids:
         harbor_command.extend(["--paper", paper_id])

@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import argparse
+from concurrent.futures import ThreadPoolExecutor, as_completed
 import json
 import os
 import re
@@ -112,11 +113,77 @@ def filtered_leaves(rubric: Any, *, code_only: bool) -> list[dict[str, Any]]:
     return code_leaves
 
 
+def rubric_leaf_contexts(
+    node: Any,
+    ancestor_requirements: tuple[str, ...] = (),
+) -> list[tuple[dict[str, Any], list[str]]]:
+    """Return every leaf with the requirements of its ancestor nodes."""
+    if not isinstance(node, dict):
+        return []
+    children = node.get("sub_tasks") if isinstance(node.get("sub_tasks"), list) else []
+    if not children:
+        return [(node, list(ancestor_requirements))]
+    requirement = str(node.get("requirements") or "").strip()
+    next_ancestors = ancestor_requirements + ((requirement,) if requirement else ())
+    out: list[tuple[dict[str, Any], list[str]]] = []
+    for child in children:
+        out.extend(rubric_leaf_contexts(child, next_ancestors))
+    return out
+
+
+def filtered_leaf_contexts(
+    rubric: Any,
+    *,
+    code_only: bool,
+) -> list[tuple[dict[str, Any], list[str]]]:
+    contexts = rubric_leaf_contexts(rubric)
+    if not code_only:
+        return contexts
+    return [
+        (leaf, ancestors)
+        for leaf, ancestors in contexts
+        if leaf.get("task_category") == "Code Development"
+    ]
+
+
 def weight_of(leaf: dict[str, Any]) -> float:
     try:
         return max(0.0, float(leaf.get("weight", 0.0)))
     except (TypeError, ValueError):
         return 0.0
+
+
+def score_rubric_tree(
+    node: Any,
+    scores: dict[str, float],
+    *,
+    code_only: bool,
+) -> float | None:
+    """Aggregate scores exactly as PaperBench does: bottom-up at every branch.
+
+    Rubric weights are local sibling weights, not globally comparable leaf
+    weights.  In code-only mode, non-code leaves are pruned before each
+    remaining sibling group is normalized.
+    """
+    if not isinstance(node, dict):
+        return None
+    children = node.get("sub_tasks") if isinstance(node.get("sub_tasks"), list) else []
+    if not children:
+        if code_only and node.get("task_category") != "Code Development":
+            return None
+        return scores.get(str(node.get("id") or ""), 0.0)
+
+    graded_children: list[tuple[float, float]] = []
+    for child in children:
+        child_score = score_rubric_tree(child, scores, code_only=code_only)
+        if child_score is not None and isinstance(child, dict):
+            graded_children.append((weight_of(child), child_score))
+    if not graded_children:
+        return None
+    total_weight = sum(weight for weight, _ in graded_children)
+    if total_weight <= 0:
+        return 0.0
+    return sum(weight * score for weight, score in graded_children) / total_weight
 
 
 def read_text(path: Path, max_chars: int) -> str:
@@ -222,26 +289,22 @@ def reproduction_summary(reproduction_dir: Path) -> dict[str, str]:
     }
 
 
-def compact_rubric(leaves: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    rows = []
-    for leaf in leaves:
-        rows.append(
-            {
-                "leaf_id": str(leaf.get("id") or ""),
-                "requirements": str(leaf.get("requirements") or ""),
-                "weight": weight_of(leaf),
-                "task_category": leaf.get("task_category"),
-                "finegrained_task_category": leaf.get("finegrained_task_category"),
-            }
-        )
-    return rows
+def compact_leaf(leaf: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "leaf_id": str(leaf.get("id") or ""),
+        "requirements": str(leaf.get("requirements") or ""),
+        "weight": weight_of(leaf),
+        "task_category": leaf.get("task_category"),
+        "finegrained_task_category": leaf.get("finegrained_task_category"),
+    }
 
 
-def build_prompt(
+def build_leaf_prompt(
     *,
     paper_id: str,
     title: str,
-    leaves: list[dict[str, Any]],
+    leaf: dict[str, Any],
+    ancestor_requirements: list[str],
     paper: dict[str, str],
     judge_addendum: str,
     raw_submission: dict[str, Any],
@@ -250,48 +313,80 @@ def build_prompt(
     code_only: bool,
 ) -> str:
     mode_text = (
-        "Code-Dev mode: grade only code development evidence. Ignore missing large-scale execution unless a code leaf explicitly requires runnable smoke support."
+        "Code-Dev mode: grade exclusively from the committed source-code evidence. "
+        "Do not require or infer credit from reproduce.sh, runtime logs, generated artifacts, "
+        "experiment execution, or reproduced results."
         if code_only
         else "Full reproduction mode: grade code, execution, results, and analysis evidence after considering reproduction logs and generated artifacts."
     )
+    evidence_rule = (
+        "Assess only whether the committed implementation satisfies each Code Development leaf. "
+        if code_only
+        else "Use reproduction failures as negative evidence for execution/result leaves, but still award code-development credit when the implementation is clear. "
+    )
+    leaf_id = str(leaf.get("id") or "")
     schema = {
-        "leaves": [
-            {
-                "leaf_id": "leaf identifier from rubric",
-                "score": 0.0,
-                "rationale": "short explanation grounded in concrete submission evidence",
-                "evidence_paths": ["relative/path.py"],
-                "invalid_reason": "",
-            }
-        ],
-        "overall_rationale": "short overall assessment",
+        "leaf_id": leaf_id,
+        "score": 0,
+        "rationale": "short explanation grounded in concrete submission evidence",
+        "evidence_paths": ["relative/path.py"],
+        "invalid_reason": "",
     }
+    submission_evidence = (
+        f"RAW SUBMISSION FILES:\n{json.dumps(raw_submission.get('files', []), ensure_ascii=False, indent=2)[:12000]}\n\n"
+        f"RAW SUBMISSION TEXT SNIPPETS:\n{raw_submission.get('text', '')[:25000]}\n"
+    )
+    if not code_only:
+        submission_evidence += (
+            f"\nEXECUTED SUBMISSION FILES:\n{json.dumps(executed_submission.get('files', []), ensure_ascii=False, indent=2)[:16000]}\n\n"
+            f"EXECUTED SUBMISSION TEXT SNIPPETS:\n{executed_submission.get('text', '')[:45000]}\n\n"
+            f"REPRODUCTION SUMMARY:\n{json.dumps(reproduction, ensure_ascii=False, indent=2)[:16000]}\n"
+        )
     return (
-        "You are an expert judge for a paper reproduction task. Grade strictly using the hidden rubric leaves. "
+        "You are an expert judge for a paper reproduction task. Grade exactly one hidden rubric leaf. "
         "Do not reward generic claims, keyword stuffing, or text that merely restates the paper. "
-        "A score of 1.0 means the submission gives concrete, relevant, and mostly correct evidence for the leaf. "
-        "A score of 0.5 means partial, plausible evidence exists but is incomplete or only small-scale. "
-        "A score of 0.0 means the evidence is missing, unsupported, or unrelated. "
-        "Use reproduction failures as negative evidence for execution/result leaves, but still award code-development credit when the implementation is clear. "
-        f"{mode_text} Return JSON only with this schema:\n{json.dumps(schema, ensure_ascii=False, indent=2)}\n\n"
+        "Every leaf is binary. Return score 1 only when the submission satisfies the complete leaf criterion "
+        "with concrete, relevant, and correct evidence; otherwise return score 0. "
+        "Do not return partial or fractional leaf scores. "
+        f"{evidence_rule}{mode_text} Return JSON only with this schema:\n{json.dumps(schema, ensure_ascii=False, indent=2)}\n\n"
         f"PAPER ID: {paper_id}\nTITLE: {title}\n\n"
         f"PUBLIC ADDENDUM:\n{paper['addendum']}\n\n"
         f"BLACKLIST SUMMARY:\n{paper['blacklist']}\n\n"
         f"HIDDEN JUDGE ADDENDUM:\n{judge_addendum[:8000]}\n\n"
-        f"RUBRIC LEAVES TO SCORE:\n{json.dumps(compact_rubric(leaves), ensure_ascii=False, indent=2)}\n\n"
+        f"EXPECTED LEAF ID: {leaf_id}\n"
+        f"ANCESTOR REQUIREMENTS (context only):\n{json.dumps(ancestor_requirements, ensure_ascii=False, indent=2)}\n\n"
+        f"RUBRIC LEAF TO SCORE:\n{json.dumps(compact_leaf(leaf), ensure_ascii=False, indent=2)}\n\n"
         f"PAPER MARKDOWN EXCERPT:\n{paper['paper_md']}\n\n"
-        f"RAW SUBMISSION FILES:\n{json.dumps(raw_submission.get('files', []), ensure_ascii=False, indent=2)[:12000]}\n\n"
-        f"RAW SUBMISSION TEXT SNIPPETS:\n{raw_submission.get('text', '')[:25000]}\n\n"
-        f"EXECUTED SUBMISSION FILES:\n{json.dumps(executed_submission.get('files', []), ensure_ascii=False, indent=2)[:16000]}\n\n"
-        f"EXECUTED SUBMISSION TEXT SNIPPETS:\n{executed_submission.get('text', '')[:45000]}\n\n"
-        f"REPRODUCTION SUMMARY:\n{json.dumps(reproduction, ensure_ascii=False, indent=2)[:16000]}\n"
+        f"{submission_evidence}"
     )
 
 
-def call_llm(prompt: str) -> dict[str, Any]:
+def isolate_leaf_response(parsed: dict[str, Any], leaf_id: str) -> dict[str, Any]:
+    """Normalize direct and legacy multi-leaf JSON to one requested leaf."""
+    raw = parsed.get("leaves")
+    if not isinstance(raw, list):
+        raw = parsed.get("items")
+    if isinstance(raw, list):
+        matching = [
+            row
+            for row in raw
+            if isinstance(row, dict)
+            and str(row.get("leaf_id") or row.get("id") or "") == leaf_id
+        ]
+        return {"leaves": matching}
+    if str(parsed.get("leaf_id") or parsed.get("id") or "") == leaf_id:
+        return {"leaves": [parsed]}
+    mapped = parsed.get(leaf_id)
+    if isinstance(mapped, dict):
+        return {"leaves": [{"leaf_id": leaf_id, **mapped}]}
+    return parsed
+
+
+def call_llm(prompt: str, *, leaf_id: str = "") -> dict[str, Any]:
     mock = os.environ.get("PAPERBENCH_JUDGE_MOCK_RESPONSE")
     if mock:
-        return extract_json_object(mock)
+        parsed = extract_json_object(mock)
+        return isolate_leaf_response(parsed, leaf_id) if leaf_id else parsed
     api_key = env_value("JUDGE_LLM_API_KEY")
     base_url = env_value("JUDGE_LLM_BASE_URL")
     model = env_value("PAPERBENCH_JUDGE_MODEL", "HARBOR_PAPERBENCH_JUDGE_MODEL", "MODEL_NAME") or "gpt-5.5"
@@ -329,8 +424,8 @@ def call_llm(prompt: str) -> dict[str, Any]:
         payload = json.loads(body)
         return payload["choices"][0]["message"].get("content") or ""
 
-    # Keep one request only: retrying the same oversized request after a timeout
-    # doubles verifier latency and turns infrastructure failures into task zeros.
+    # Each leaf gets one request. Retrying it after a timeout would make verifier
+    # latency unpredictable; a failed leaf is instead isolated and scored zero.
     # Do not send temperature for gpt-5.5-compatible upstreams that reject it.
     base_payload = {"model": model, "messages": messages}
     content = post(base_payload)
@@ -347,6 +442,7 @@ def parse_leaf_scores(parsed: dict[str, Any], leaves: list[dict[str, Any]]) -> t
     scores: dict[str, float] = {}
     details: list[dict[str, Any]] = []
     invalid_count = 0
+    seen_ids: set[str] = set()
     for row in raw:
         if not isinstance(row, dict):
             invalid_count += 1
@@ -355,7 +451,18 @@ def parse_leaf_scores(parsed: dict[str, Any], leaves: list[dict[str, Any]]) -> t
         if leaf_id not in valid_ids:
             invalid_count += 1
             continue
-        score = clipped(row.get("score"))
+        if leaf_id in seen_ids:
+            invalid_count += 1
+            continue
+        seen_ids.add(leaf_id)
+        raw_score = row.get("score")
+        if isinstance(raw_score, bool) or not isinstance(raw_score, (int, float)) or float(raw_score) not in {0.0, 1.0}:
+            score = 0.0
+            invalid_count += 1
+            parser_invalid_reason = "leaf score must be exactly 0 or 1"
+        else:
+            score = float(raw_score)
+            parser_invalid_reason = ""
         scores[leaf_id] = score
         details.append(
             {
@@ -363,33 +470,159 @@ def parse_leaf_scores(parsed: dict[str, Any], leaves: list[dict[str, Any]]) -> t
                 "score": score,
                 "rationale": str(row.get("rationale") or "")[:2000],
                 "evidence_paths": row.get("evidence_paths") if isinstance(row.get("evidence_paths"), list) else [],
-                "invalid_reason": str(row.get("invalid_reason") or "")[:1000],
+                "invalid_reason": (
+                    parser_invalid_reason or str(row.get("invalid_reason") or "")[:1000]
+                ),
             }
         )
     return scores, details, invalid_count
 
 
+def grade_leaf_requests(
+    *,
+    rubric: Any,
+    paper_id: str,
+    title: str,
+    paper: dict[str, str],
+    judge_addendum: str,
+    raw_submission: dict[str, Any],
+    executed_submission: dict[str, Any],
+    reproduction: dict[str, str],
+    code_only: bool,
+    max_workers: int,
+) -> tuple[dict[str, float], list[dict[str, Any]], dict[str, int]]:
+    contexts = filtered_leaf_contexts(rubric, code_only=code_only)
+    if not contexts:
+        return {}, [], {"request_count": 0, "request_success_count": 0, "parse_success_count": 0}
+    if max_workers <= 0:
+        raise ValueError("judge max_workers must be positive")
+
+    def grade_one(
+        index: int,
+        leaf: dict[str, Any],
+        ancestors: list[str],
+    ) -> tuple[int, str, float, dict[str, Any], bool, bool]:
+        leaf_id = str(leaf.get("id") or "")
+        try:
+            prompt = build_leaf_prompt(
+                paper_id=paper_id,
+                title=title,
+                leaf=leaf,
+                ancestor_requirements=ancestors,
+                paper=paper,
+                judge_addendum=judge_addendum,
+                raw_submission=raw_submission,
+                executed_submission=executed_submission,
+                reproduction=reproduction,
+                code_only=code_only,
+            )
+            parsed = isolate_leaf_response(call_llm(prompt, leaf_id=leaf_id), leaf_id)
+            scores, details, invalid_count = parse_leaf_scores(parsed, [leaf])
+            missing = leaf_id not in scores
+            parse_ok = invalid_count == 0 and not missing
+            detail = details[0] if details else {
+                "leaf_id": leaf_id,
+                "score": 0.0,
+                "rationale": "",
+                "evidence_paths": [],
+                "invalid_reason": "judge response omitted the requested leaf",
+            }
+            detail["judge_available"] = True
+            detail["llm_parse_ok"] = parse_ok
+            return index, leaf_id, scores.get(leaf_id, 0.0), detail, True, parse_ok
+        except Exception as exc:
+            detail = {
+                "leaf_id": leaf_id,
+                "score": 0.0,
+                "rationale": "",
+                "evidence_paths": [],
+                "invalid_reason": f"{type(exc).__name__}: {exc}"[:1000],
+                "judge_available": False,
+                "llm_parse_ok": False,
+            }
+            return index, leaf_id, 0.0, detail, False, False
+
+    completed = []
+    worker_count = min(max_workers, len(contexts))
+    with ThreadPoolExecutor(max_workers=worker_count) as executor:
+        futures = [
+            executor.submit(grade_one, index, leaf, ancestors)
+            for index, (leaf, ancestors) in enumerate(contexts)
+        ]
+        for future in as_completed(futures):
+            completed.append(future.result())
+    completed.sort(key=lambda row: row[0])
+    scores = {leaf_id: score for _, leaf_id, score, _, _, _ in completed}
+    details = [detail for _, _, _, detail, _, _ in completed]
+    summary = {
+        "request_count": len(completed),
+        "request_success_count": sum(1 for *_, available, _ in completed if available),
+        "parse_success_count": sum(1 for *_, parse_ok in completed if parse_ok),
+        "max_workers": worker_count,
+    }
+    return scores, details, summary
+
+
 def grade(args: argparse.Namespace) -> int:
     rubric = read_json(args.rubric)
-    leaves = filtered_leaves(rubric, code_only=args.code_only)
+    try:
+        config = read_json(args.judge_config)
+    except Exception:
+        config = {}
+    code_only = bool(args.code_only or config.get("code_only"))
+    leaves = filtered_leaves(rubric, code_only=code_only)
     total_weight = sum(weight_of(leaf) for leaf in leaves)
     reproduction_ran = clipped(args.reproduction_ran)
     reproduction_success = clipped(args.reproduction_success)
     details_base = {
         "paper_id": "",
         "title": "",
-        "code_only": bool(args.code_only),
+        "code_only": code_only,
         "leaf_count": len(leaves),
         "rubric_weight_total": total_weight,
         "reproduction_ran": reproduction_ran,
         "reproduction_success": reproduction_success,
     }
     try:
-        config = read_json(args.judge_config)
         details_base["paper_id"] = str(config.get("paper_id") or "")
         details_base["title"] = str(config.get("title") or "")
     except Exception:
-        config = {}
+        pass
+    submission_validation: dict[str, Any] = {}
+    try:
+        submission_validation = read_json(args.submission_validation)
+    except Exception as exc:
+        submission_validation = {
+            "submission_valid": False,
+            "validation_error": f"{type(exc).__name__}: {exc}",
+        }
+    details_base["submission_validation"] = submission_validation
+    if not submission_validation.get("submission_valid"):
+        submission_present = 1.0 if submission_validation.get("submission_dir_exists") else 0.0
+        reward = numeric_reward(
+            score=0.0,
+            format_score=0.0,
+            submission_present=submission_present,
+            judge_available=0.0,
+            llm_parse_ok=0.0,
+            leaf_count=len(leaves),
+            invalid_leaf_count=len(leaves),
+            rubric_weight_total=total_weight,
+            reproduction_ran=reproduction_ran,
+            reproduction_success=reproduction_success,
+            code_only=code_only,
+        )
+        write_json(args.reward_json, reward)
+        write_json(
+            args.details_json,
+            {
+                **details_base,
+                "ok": True,
+                "reason": "submission failed Git repository validation",
+                "leaves": [],
+            },
+        )
+        return 0
     if not args.submission_dir.is_dir():
         reward = numeric_reward(
             score=0.0,
@@ -402,62 +635,68 @@ def grade(args: argparse.Namespace) -> int:
             rubric_weight_total=total_weight,
             reproduction_ran=reproduction_ran,
             reproduction_success=reproduction_success,
-            code_only=args.code_only,
+            code_only=code_only,
         )
         write_json(args.reward_json, reward)
-        write_json(args.details_json, {**details_base, "ok": True, "reason": "missing submission directory", "leaves": []})
+        write_json(
+            args.details_json,
+            {**details_base, "ok": True, "reason": "missing cleaned submission directory", "leaves": []},
+        )
         return 0
     readme = args.submission_dir / "README.md"
     reproduce = args.submission_dir / "reproduce.sh"
-    format_score = 1.0 if readme.is_file() and reproduce.is_file() else 0.25
+    format_score = 1.0 if readme.is_file() and (code_only or reproduce.is_file()) else 0.25
     raw_submission = collect_submission(args.submission_dir)
     executed_submission = collect_submission(args.executed_submission_dir)
     paper = paper_excerpt(args.paper_dir)
     judge_addendum = read_text(args.judge_addendum, 20000)
     repro = reproduction_summary(args.reproduction_dir)
     try:
-        prompt = build_prompt(
+        configured_workers = os.environ.get(
+            "PAPERBENCH_JUDGE_MAX_WORKERS",
+            str(config.get("max_workers") or "100"),
+        )
+        max_workers = int(configured_workers)
+        scores, leaf_details, judge_summary = grade_leaf_requests(
+            rubric=rubric,
             paper_id=str(config.get("paper_id") or ""),
             title=str(config.get("title") or ""),
-            leaves=leaves,
             paper=paper,
             judge_addendum=judge_addendum,
             raw_submission=raw_submission,
             executed_submission=executed_submission,
             reproduction=repro,
-            code_only=args.code_only,
+            code_only=code_only,
+            max_workers=max_workers,
         )
-        parsed = call_llm(prompt)
-        scores, leaf_details, invalid_count = parse_leaf_scores(parsed, leaves)
-        weighted = 0.0
-        if total_weight <= 0:
-            weighted = sum(scores.get(str(leaf.get("id") or ""), 0.0) for leaf in leaves) / max(1, len(leaves))
-        else:
-            for leaf in leaves:
-                weighted += (weight_of(leaf) / total_weight) * scores.get(str(leaf.get("id") or ""), 0.0)
-        score = clipped(weighted) * format_score
+        request_count = judge_summary["request_count"]
+        request_success_count = judge_summary["request_success_count"]
+        parse_success_count = judge_summary["parse_success_count"]
+        invalid_count = request_count - parse_success_count
+        weighted = score_rubric_tree(rubric, scores, code_only=code_only)
+        score = clipped(weighted if weighted is not None else 0.0)
         reward = numeric_reward(
             score=score,
             format_score=format_score,
             submission_present=1.0,
-            judge_available=1.0,
-            llm_parse_ok=1.0,
+            judge_available=(request_success_count / request_count if request_count else 0.0),
+            llm_parse_ok=(parse_success_count / request_count if request_count else 0.0),
             leaf_count=len(leaves),
-            invalid_leaf_count=invalid_count + max(0, len(leaves) - len(scores)),
+            invalid_leaf_count=invalid_count,
             rubric_weight_total=total_weight,
             reproduction_ran=reproduction_ran,
             reproduction_success=reproduction_success,
-            code_only=args.code_only,
+            code_only=code_only,
         )
         write_json(args.reward_json, reward)
         write_json(
             args.details_json,
             {
                 **details_base,
-                "ok": True,
+                "ok": request_success_count > 0,
                 "score": score,
                 "format_score": format_score,
-                "judge": parsed,
+                "judge": {"mode": "per_leaf", **judge_summary},
                 "leaves": leaf_details,
                 "submission_files": raw_submission.get("files", []),
                 "executed_submission_files": executed_submission.get("files", []),
@@ -476,7 +715,7 @@ def grade(args: argparse.Namespace) -> int:
             rubric_weight_total=total_weight,
             reproduction_ran=reproduction_ran,
             reproduction_success=reproduction_success,
-            code_only=args.code_only,
+            code_only=code_only,
         )
         write_json(args.reward_json, reward)
         write_json(args.details_json, {**details_base, "ok": False, "error": f"{type(exc).__name__}: {exc}"})
@@ -491,6 +730,7 @@ def main() -> int:
     parser.add_argument("--rubric", type=Path, required=True)
     parser.add_argument("--judge-addendum", type=Path, required=True)
     parser.add_argument("--judge-config", type=Path, required=True)
+    parser.add_argument("--submission-validation", type=Path, required=True)
     parser.add_argument("--reproduction-dir", type=Path, required=True)
     parser.add_argument("--reproduction-ran", required=True)
     parser.add_argument("--reproduction-success", required=True)

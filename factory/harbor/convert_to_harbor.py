@@ -18,25 +18,39 @@ import shutil
 import stat
 import sys
 import tempfile
+import tomllib
 from pathlib import Path
 from typing import Any, Iterable
 
 
 RUBRICS_FACTORY_DIR = Path(__file__).resolve().parents[1] / "rubrics"
 sys.path.insert(0, str(RUBRICS_FACTORY_DIR))
-from rubric_lib import validate_addendum, validate_rubric  # noqa: E402
+from rubric_lib import (  # noqa: E402
+    CODE_DEV_DERIVATION,
+    paperbench_code_only_rubric,
+    validate_addendum,
+    validate_rubric,
+)
 
 
 HARBOR_TEMPLATE_TASK = Path(__file__).resolve().with_name("templates") / "processed_task"
 OFFICIAL_PAPERBENCH_INSTRUCTIONS = (
     Path(__file__).resolve().with_name("templates") / "instructions.official.txt"
 )
+OFFICIAL_PAPERBENCH_CODE_DEV_INSTRUCTIONS = (
+    Path(__file__).resolve().with_name("templates") / "instructions.code-dev.official.txt"
+)
 OFFICIAL_PAPERBENCH_INSTRUCTIONS_SHA256 = (
     "712ed3968de5b8d98b96e25e7d33c95552c460649201743d8535e84c344bac56"
+)
+OFFICIAL_PAPERBENCH_CODE_DEV_INSTRUCTIONS_SHA256 = (
+    "65a75977810a1bca53e69767740c07f5c71c6d632838ebd32ba22d69e2a49d9e"
 )
 HARBOR_WORKDIR = "/home"
 HARBOR_PAPER_DIR = "/home/paper"
 HARBOR_SUBMISSION_DIR = "/home/submission"
+HARBOR_GPU_TYPE = "H200"
+HARBOR_RESOURCE_METADATA_VERSION = "harbor_resource_metadata_v3"
 PREFERRED_KINDS = ["json", "image", "pdf", "text", "code", "shell", "archive", "binary"]
 REQUIRED_TASK_FILES = {
     "task.toml",
@@ -129,15 +143,24 @@ def default_template_task() -> Path:
     return HARBOR_TEMPLATE_TASK
 
 
-def render_harbor_instructions(path: Path) -> bytes:
+def render_harbor_instructions(path: Path, *, rubric_mode: str) -> bytes:
     raw = path.read_bytes()
     actual_hash = sha256_bytes(raw)
-    if actual_hash != OFFICIAL_PAPERBENCH_INSTRUCTIONS_SHA256:
+    expected_hash = (
+        OFFICIAL_PAPERBENCH_CODE_DEV_INSTRUCTIONS_SHA256
+        if rubric_mode == "code-dev"
+        else OFFICIAL_PAPERBENCH_INSTRUCTIONS_SHA256
+    )
+    if actual_hash != expected_hash:
         raise ValueError(
             "instructions file is not the pinned official PaperBench instructions: "
-            f"expected {OFFICIAL_PAPERBENCH_INSTRUCTIONS_SHA256}, found {actual_hash}"
+            f"expected {expected_hash}, found {actual_hash}"
         )
     text = raw.decode("utf-8")
+    if rubric_mode == "code-dev":
+        if "The code will not be executed during grading." not in text:
+            raise ValueError("official code-dev instructions lost the no-execution contract")
+        return raw
     old_gpu = "NVIDIA A10 GPU"
     if text.count(old_gpu) != 1:
         raise ValueError("official instructions no longer contain exactly one A10 GPU clause")
@@ -183,24 +206,42 @@ def rubric_leaf_count(node: Any) -> int:
     return sum(rubric_leaf_count(child) for child in children)
 
 
-def select_authored_file(
+def select_authored_bundle(
     root: Path,
     paper_id: str,
     *,
-    published_name: str,
-    draft_name: str,
+    rubric_mode: str,
     require_approved: bool,
-) -> tuple[Path, str]:
-    published = root / "paper_sources" / paper_id / published_name
-    draft = root / "design" / paper_id / "rubric_authoring" / draft_name
-    if published.is_file():
-        return published, "published"
+) -> tuple[Path, Path, str, str]:
+    paper_dir = root / "paper_sources" / paper_id
+    authoring_dir = root / "design" / paper_id / "rubric_authoring"
+    published = (paper_dir / "rubric.json", paper_dir / "addendum.md")
+    draft = (authoring_dir / "rubric.draft.json", authoring_dir / "addendum.draft.md")
+    approval_path = authoring_dir / "human_approval.json"
+    provenance_path = authoring_dir / "authoring_provenance.json"
+    approval = read_json(approval_path) if approval_path.is_file() else {}
+    provenance = read_json(provenance_path) if provenance_path.is_file() else {}
+    published_mode = approval.get("rubric_mode", "regular") if isinstance(approval, dict) else "regular"
+    draft_mode = provenance.get("rubric_mode", "regular") if isinstance(provenance, dict) else "regular"
+
+    acceptable_modes = {rubric_mode}
+    if rubric_mode == "code-dev":
+        # Official PaperBench derives Code-Dev by pruning the complete regular
+        # rubric, so a reviewed regular bundle is a valid (and preferred)
+        # source for a code-dev Harbor view.
+        acceptable_modes.add("regular")
+    if all(path.is_file() for path in published) and published_mode in acceptable_modes:
+        return published[0], published[1], "published", published_mode
     if require_approved:
-        raise FileNotFoundError(f"{paper_id}: approved {published_name} is required: {published}")
-    if draft.is_file():
-        return draft, "authoring-draft"
+        raise FileNotFoundError(
+            f"{paper_id}: approved rubric/addendum source for {rubric_mode!r} is required; "
+            f"acceptable source modes={sorted(acceptable_modes)}"
+        )
+    if all(path.is_file() for path in draft) and draft_mode in acceptable_modes:
+        return draft[0], draft[1], "authoring-draft", draft_mode
     raise FileNotFoundError(
-        f"{paper_id}: neither published nor draft {published_name} exists"
+        f"{paper_id}: no complete rubric/addendum pair for mode {rubric_mode!r}; "
+        f"published mode={published_mode!r}, draft mode={draft_mode!r}"
     )
 
 
@@ -216,6 +257,17 @@ Use the submitted source code, `reproduce.sh`, reproduction logs, and generated 
 - Penalize fabricated, pre-written, or unsupported result claims that cannot be connected to executable code.
 """
 
+GENERIC_CODE_DEV_JUDGE_ADDENDUM = """# Judge-only evaluation guidance
+
+Use the submitted committed source code and README as evidence. Do not execute the code and do not require
+runtime logs, generated metrics, reproduced trends, or a working reproduce.sh.
+
+- Every rubric leaf evaluates Code Development only.
+- Require concrete implementation evidence; prose-only claims are insufficient.
+- Judge equivalent implementations by behavior and scientific fidelity, not by file layout.
+- Do not award credit for fabricated outputs or claimed results in place of implementation.
+"""
+
 
 def resource_profile(metadata: dict[str, Any]) -> dict[str, Any]:
     compute = metadata.get("compute") if isinstance(metadata.get("compute"), dict) else {}
@@ -224,8 +276,10 @@ def resource_profile(metadata: dict[str, Any]) -> dict[str, Any]:
     cpu_only = "cpu" in accelerator and not any(token in accelerator for token in ("gpu", "h200", "a100", "h100"))
     if cpu_only:
         paper_profile = "cpu_sufficient"
-        rollout_profile = "docker_cpu_smoke"
-        rollout_gpus = 0
+        # PaperBench's official instruction promises an available GPU even when
+        # the selected reproduction itself can run on CPU.
+        rollout_profile = "gpu_capable"
+        rollout_gpus = 1
         vram = {"min": 1.0, "typical": 2.0, "max": 6.0}
     elif any(token in accelerator + " " + notes for token in ("gpu", "h200", "a100", "h100")):
         paper_profile = "gpu_relevant"
@@ -317,20 +371,21 @@ def make_resource_metadata(
 ) -> dict[str, Any]:
     profile = resource_profile(metadata)
     estimate = {
-        "gpu_tier": "consumer_20g",
+        "gpu_tier": HARBOR_GPU_TYPE,
         "gpu_required": True,
+        "gpu_count": 1,
         "estimated_vram_gb": profile["vram"],
         "training_time_tier": "under_6h",
         "confidence": 0.75,
         "reason": (
             "Deterministic estimate from the selected paper's authoring metadata and declared "
             f"compute envelope; classified as {profile['paper_resource_profile']}. The verifier "
-            "uses one GPU so the processed Harbor consistency contract selects consumer_20g."
+            f"uses one {HARBOR_GPU_TYPE} GPU, matching the task runtime contract."
         ),
         "attempts": 1,
     }
     return {
-        "schema_version": "harbor_resource_metadata_v1",
+        "schema_version": HARBOR_RESOURCE_METADATA_VERSION,
         "created_at": dt.datetime.now(dt.timezone.utc).isoformat(),
         "data_profile": data_profile,
         "resource_estimate": estimate,
@@ -340,6 +395,7 @@ def make_resource_metadata(
             "prompt_version": "paperbench_harbor_resource_rules_v1",
             "validation_history": [[]],
             "declared_max_gpus": 1,
+            "declared_gpu_tier": HARBOR_GPU_TYPE,
         },
     }
 
@@ -357,44 +413,65 @@ def make_task_toml(
     timeout_sec: int,
     reproduction_timeout_sec: int,
     judge_request_timeout_sec: int,
+    judge_max_workers: int,
     docker_image: str,
+    rubric_mode: str,
 ) -> str:
     profile = resource_profile(metadata)
     data = resource_metadata["data_profile"]
     estimate = resource_metadata["resource_estimate"]
     keywords = sorted({paper_id, "paper-reproduction", "paperbench", "research"})
+    code_only = rubric_mode == "code-dev"
+    description = (
+        f"Implement the core methods from {title}"
+        if code_only
+        else f"Reproduce core methods and experiments from {title}"
+    )
+    paperbench_mode = "llm_code_dev" if code_only else "llm_full"
+    reproduction_profile = "not_executed" if code_only else "gpu_capable"
+    code_dev_metadata = (
+        f"code_dev_derivation = {json_string(CODE_DEV_DERIVATION)}\n"
+        if code_only
+        else ""
+    )
     return f'''schema_version = "1.4"
 artifacts = [{json_string(HARBOR_SUBMISSION_DIR)}]
 
 [task]
 name = {json_string(f"mlcoding/{task_id}")}
-description = {json_string(f"Reproduce core methods and experiments from {title}")}
+description = {json_string(description)}
 keywords = {toml_array(keywords)}
 
 [metadata]
 benchmark = "paperbench"
 source_format = "paperbench_official_style_harbor_adapted"
+source_native_contract = "paperbench_authored_task_v1"
+construction_format = "native_rollout_task_v1"
 paper_id = {json_string(paper_id)}
+native_task_id = {json_string(paper_id)}
 rubric_leaf_count = {leaf_count}
 oracle_available = false
+reference_solution_available = false
 scoring_method = "llm_rubric_judge"
-paperbench_mode = "llm_full"
-code_only = false
-paper_resource_profile = {json_string(profile["paper_resource_profile"])}
+paperbench_mode = {json_string(paperbench_mode)}
+code_only = {str(code_only).lower()}
+rubric_mode = {json_string(rubric_mode)}
+{code_dev_metadata}paper_resource_profile = {json_string(profile["paper_resource_profile"])}
 rollout_resource_profile = {json_string(profile["rollout_resource_profile"])}
-reproduction_resource_profile = "gpu_capable"
+reproduction_resource_profile = {json_string(reproduction_profile)}
 rollout_profile = "research_long_horizon_v1"
 score_ladder_version = "task_internal_score_ladder_v1"
 artifact_stop_first_valid = false
 pipeline_commit = {json_string(pipeline_commit)}
 source_task_key = {json_string(paper_id)}
-resource_metadata_version = "harbor_resource_metadata_v1"
+resource_metadata_version = {json_string(HARBOR_RESOURCE_METADATA_VERSION)}
 resource_metadata_file = "resource_metadata.json"
 data_total_bytes = {data["total_bytes"]}
 data_file_count = {data["file_count"]}
 data_kinds = {toml_array(data["data_kinds"])}
 gpu_tier = {json_string(estimate["gpu_tier"])}
 gpu_required = true
+gpu_count = 1
 estimated_training_time_tier = {json_string(estimate["training_time_tier"])}
 estimated_vram_gb_typical = {estimate["estimated_vram_gb"]["typical"]:g}
 resource_estimate_confidence = {estimate["confidence"]:g}
@@ -411,6 +488,7 @@ environment_mode = "separate"
 [verifier.env]
 PAPERBENCH_JUDGE_MODEL = {json_string(judge_model)}
 PAPERBENCH_JUDGE_TIMEOUT_SEC = {json_string(str(judge_request_timeout_sec))}
+PAPERBENCH_JUDGE_MAX_WORKERS = {json_string(str(judge_max_workers))}
 PAPERBENCH_REPRODUCTION_TIMEOUT_SEC = {json_string(str(reproduction_timeout_sec))}
 
 [verifier.environment]
@@ -421,6 +499,7 @@ cpus = 2
 memory_mb = 4096
 storage_mb = 16384
 gpus = 1
+gpu_types = [{json_string(HARBOR_GPU_TYPE)}]
 docker_image = {json_string(docker_image)}
 workdir = "/tests"
 
@@ -432,6 +511,7 @@ cpus = 4
 memory_mb = 8192
 storage_mb = 16384
 gpus = {profile["rollout_gpus"]}
+gpu_types = [{json_string(HARBOR_GPU_TYPE)}]
 docker_image = {json_string(docker_image)}
 workdir = {json_string(HARBOR_WORKDIR)}
 '''
@@ -473,7 +553,7 @@ def pipeline_fingerprint(template: Path, instructions_file: Path) -> str:
     digest = hashlib.sha256()
     paths = [
         ("convert_to_harbor.py", Path(__file__).resolve()),
-        ("instructions.official.txt", instructions_file),
+        (f"instructions/{instructions_file.name}", instructions_file),
     ]
     paths.extend(
         (f"template/{relative}", template / relative)
@@ -507,8 +587,10 @@ def build_one(
     timeout_sec: int,
     reproduction_timeout_sec: int,
     judge_request_timeout_sec: int,
+    judge_max_workers: int,
     docker_image: str,
     instructions_content: bytes,
+    rubric_mode: str,
 ) -> dict[str, Any]:
     paper_id = paper["id"]
     title = paper.get("title")
@@ -516,22 +598,34 @@ def build_one(
         raise ValueError(f"{paper_id}: title is required")
     metadata_path = root / "design" / paper_id / "task_metadata.json"
     metadata = read_json(metadata_path) if metadata_path.is_file() else paper
-    rubric_path, rubric_status = select_authored_file(
+    rubric_path, addendum_path, authored_status, source_rubric_mode = select_authored_bundle(
         root,
         paper_id,
-        published_name="rubric.json",
-        draft_name="rubric.draft.json",
+        rubric_mode=rubric_mode,
         require_approved=require_approved,
     )
-    addendum_path, addendum_status = select_authored_file(
-        root,
-        paper_id,
-        published_name="addendum.md",
-        draft_name="addendum.draft.md",
-        require_approved=require_approved,
+    source_record_path = (
+        root / "design" / paper_id / "rubric_authoring" / "human_approval.json"
+        if authored_status == "published"
+        else root / "design" / paper_id / "rubric_authoring" / "authoring_provenance.json"
     )
-    rubric = read_json(rubric_path)
-    rubric_report = validate_rubric(rubric)
+    source_record = read_json(source_record_path) if source_record_path.is_file() else {}
+    if (
+        rubric_mode == "code-dev"
+        and source_rubric_mode == "code-dev"
+        and source_record.get("code_dev_derivation") != CODE_DEV_DERIVATION
+    ):
+        raise ValueError(
+            f"{paper_id}: code-dev source was not derived with {CODE_DEV_DERIVATION}; "
+            "regenerate it or supply a complete regular rubric"
+        )
+    source_rubric = read_json(rubric_path)
+    rubric = (
+        paperbench_code_only_rubric(source_rubric)
+        if rubric_mode == "code-dev"
+        else source_rubric
+    )
+    rubric_report = validate_rubric(rubric, rubric_mode=rubric_mode)
     if not rubric_report["valid"]:
         raise ValueError(
             f"{paper_id}: invalid rubric:\n- " + "\n- ".join(rubric_report["errors"])
@@ -560,6 +654,15 @@ def build_one(
     leaf_count = rubric_leaf_count(rubric)
     if leaf_count <= 0:
         raise ValueError(f"{paper_id}: rubric has no leaves")
+    judge_waves = (leaf_count + judge_max_workers - 1) // judge_max_workers
+    required_timeout = judge_waves * judge_request_timeout_sec + 60
+    if rubric_mode != "code-dev":
+        required_timeout += reproduction_timeout_sec
+    if required_timeout > timeout_sec:
+        raise ValueError(
+            f"{paper_id}: --timeout-sec={timeout_sec} is too small for {leaf_count} leaves "
+            f"at --judge-max-workers={judge_max_workers}; need at least {required_timeout} seconds"
+        )
 
     tests_dir = output_task_dir / "tests"
     solution_dir = output_task_dir / "solution"
@@ -573,26 +676,41 @@ def build_one(
         template / "tests" / "llm_rubric_judge.py",
         tests_dir / "llm_rubric_judge.py",
     )
-    shutil.copy2(rubric_path, tests_dir / "rubric.json")
-    judge_addendum_candidates = [
-        root / "paper_sources" / paper_id / "judge.addendum.md",
-        root / "design" / paper_id / "rubric_authoring" / "judge.addendum.draft.md",
-    ]
-    judge_addendum = next((path for path in judge_addendum_candidates if path.is_file()), None)
+    # In Code-Dev this is the deterministic official code-only view, not an
+    # unmodified copy of the complete source rubric.
+    write_json(tests_dir / "rubric.json", rubric)
+    judge_addendum = (
+        root / "paper_sources" / paper_id / "judge.addendum.md"
+        if authored_status == "published"
+        else root / "design" / paper_id / "rubric_authoring" / "judge.addendum.draft.md"
+    )
+    if not judge_addendum.is_file():
+        judge_addendum = None
     if judge_addendum:
         shutil.copy2(judge_addendum, tests_dir / "judge.addendum.md")
     else:
         (tests_dir / "judge.addendum.md").write_text(
-            GENERIC_JUDGE_ADDENDUM, encoding="utf-8"
+            (
+                GENERIC_CODE_DEV_JUDGE_ADDENDUM
+                if rubric_mode == "code-dev"
+                else GENERIC_JUDGE_ADDENDUM
+            ),
+            encoding="utf-8",
         )
     write_json(
         tests_dir / "judge_config.json",
         {
-            "judge_mode": "llm_full",
-            "code_only": False,
+            "judge_mode": "llm_code_dev" if rubric_mode == "code-dev" else "llm_full",
+            "code_only": rubric_mode == "code-dev",
+            "rubric_mode": rubric_mode,
+            "code_dev_derivation": (
+                CODE_DEV_DERIVATION if rubric_mode == "code-dev" else None
+            ),
             "paper_id": paper_id,
             "title": title,
             "judge_model_env": "PAPERBENCH_JUDGE_MODEL",
+            "request_mode": "per_leaf",
+            "max_workers": judge_max_workers,
         },
     )
 
@@ -623,16 +741,25 @@ def build_one(
             timeout_sec=timeout_sec,
             reproduction_timeout_sec=reproduction_timeout_sec,
             judge_request_timeout_sec=judge_request_timeout_sec,
+            judge_max_workers=judge_max_workers,
             docker_image=docker_image,
+            rubric_mode=rubric_mode,
         ),
         encoding="utf-8",
     )
     normalize_task_permissions(output_task_dir)
     return {
         "paper_id": paper_id,
-        "rubric_source": rubric_status,
-        "addendum_source": addendum_status,
+        "rubric_source": authored_status,
+        "source_rubric_mode": source_rubric_mode,
+        "code_dev_derivation": (
+            CODE_DEV_DERIVATION
+            if rubric_mode == "code-dev"
+            else None
+        ),
+        "addendum_source": authored_status,
         "rubric_leaf_count": leaf_count,
+        "rubric_mode": rubric_mode,
         "data_profile": data_profile,
     }
 
@@ -663,6 +790,7 @@ def validate_harbor_batch(
     *,
     instructions_content: bytes | None = None,
     template_task: Path | None = None,
+    rubric_mode: str = "regular",
 ) -> dict[str, Any]:
     errors: list[str] = []
     manifest_path = batch_dir / "manifest.jsonl"
@@ -743,10 +871,16 @@ def validate_harbor_batch(
             for required in (HARBOR_PAPER_DIR, HARBOR_SUBMISSION_DIR):
                 if required not in instruction_text:
                     errors.append(f"{task_id}: instruction.md missing {required}")
-            if "for a maximum runtime of 7 days" not in instruction_text:
-                errors.append(f"{task_id}: instruction.md changed the official seven-day runtime")
-            if "NVIDIA H200 GPU" not in instruction_text or "NVIDIA A10 GPU" in instruction_text:
-                errors.append(f"{task_id}: instruction.md does not contain the H200-only GPU adaptation")
+            if rubric_mode == "code-dev":
+                if "The code will not be executed during grading." not in instruction_text:
+                    errors.append(f"{task_id}: instruction.md lost the official code-dev contract")
+                if "for a maximum runtime of 7 days" in instruction_text:
+                    errors.append(f"{task_id}: code-dev instruction unexpectedly promises execution")
+            else:
+                if "for a maximum runtime of 7 days" not in instruction_text:
+                    errors.append(f"{task_id}: instruction.md changed the official seven-day runtime")
+                if "NVIDIA H200 GPU" not in instruction_text or "NVIDIA A10 GPU" in instruction_text:
+                    errors.append(f"{task_id}: instruction.md does not contain the H200-only GPU adaptation")
         if template_task:
             for relative in (
                 "tests/test.sh",
@@ -757,14 +891,28 @@ def validate_harbor_batch(
                     task_dir / relative
                 ).read_bytes() != (template_task / relative).read_bytes():
                     errors.append(f"{task_id}: {relative} differs from Harbor reference template")
+        task_config: dict[str, Any] | None = None
         task_toml = task_dir / "task.toml"
         if task_toml.is_file():
             toml_text = task_toml.read_text(encoding="utf-8")
+            try:
+                task_config = tomllib.loads(toml_text)
+            except tomllib.TOMLDecodeError as exc:
+                errors.append(f"{task_id}: task.toml is invalid TOML: {exc}")
             for required_text in (
                 'schema_version = "1.4"',
                 f'artifacts = [{json_string(HARBOR_SUBMISSION_DIR)}]',
+                'source_native_contract = "paperbench_authored_task_v1"',
+                'construction_format = "native_rollout_task_v1"',
                 f'paper_id = {json_string(str(row.get("paper_id", "")))}',
+                f'native_task_id = {json_string(str(row.get("paper_id", "")))}',
+                'reference_solution_available = false',
                 'scoring_method = "llm_rubric_judge"',
+                f'rubric_mode = {json_string(rubric_mode)}',
+                f'code_only = {str(rubric_mode == "code-dev").lower()}',
+                f'resource_metadata_version = {json_string(HARBOR_RESOURCE_METADATA_VERSION)}',
+                f'gpu_tier = {json_string(HARBOR_GPU_TYPE)}',
+                'gpu_count = 1',
                 'environment_mode = "separate"',
                 'workdir = "/tests"',
                 f'workdir = {json_string(HARBOR_WORKDIR)}',
@@ -779,17 +927,79 @@ def validate_harbor_batch(
             ):
                 if forbidden in toml_text:
                     errors.append(f"{task_id}: task.toml contains forbidden env template {forbidden!r}")
+            if task_config is not None:
+                task_metadata = task_config.get("metadata")
+                if not isinstance(task_metadata, dict):
+                    errors.append(f"{task_id}: task.toml missing [metadata]")
+                elif rubric_mode == "code-dev" and task_metadata.get(
+                    "code_dev_derivation"
+                ) != CODE_DEV_DERIVATION:
+                    errors.append(f"{task_id}: task.toml code-dev derivation mismatch")
+                for section in ("environment", "verifier.environment"):
+                    value: Any = task_config
+                    for key in section.split("."):
+                        value = value.get(key) if isinstance(value, dict) else None
+                    if not isinstance(value, dict):
+                        errors.append(f"{task_id}: task.toml missing [{section}]")
+                        continue
+                    if value.get("gpus") != 1:
+                        errors.append(f"{task_id}: [{section}].gpus must be 1")
+                    if value.get("gpu_types") != [HARBOR_GPU_TYPE]:
+                        errors.append(
+                            f'{task_id}: [{section}].gpu_types must be ["{HARBOR_GPU_TYPE}"]'
+                        )
+        judge_config_path = task_dir / "tests" / "judge_config.json"
+        if judge_config_path.is_file():
+            judge_config = read_json(judge_config_path)
+            if judge_config.get("rubric_mode") != rubric_mode:
+                errors.append(f"{task_id}: judge_config rubric_mode mismatch")
+            if judge_config.get("code_only") is not (rubric_mode == "code-dev"):
+                errors.append(f"{task_id}: judge_config code_only mismatch")
+            if judge_config.get("request_mode") != "per_leaf":
+                errors.append(f"{task_id}: judge_config request_mode must be per_leaf")
+            if not isinstance(judge_config.get("max_workers"), int) or judge_config["max_workers"] <= 0:
+                errors.append(f"{task_id}: judge_config max_workers must be a positive integer")
+            if rubric_mode == "code-dev" and judge_config.get(
+                "code_dev_derivation"
+            ) != CODE_DEV_DERIVATION:
+                errors.append(f"{task_id}: judge_config code-dev derivation mismatch")
+        rubric_path = task_dir / "tests" / "rubric.json"
+        if rubric_path.is_file():
+            rubric_report = validate_rubric(read_json(rubric_path), rubric_mode=rubric_mode)
+            if not rubric_report["valid"]:
+                errors.extend(
+                    f"{task_id}: rubric mode validation: {error}"
+                    for error in rubric_report["errors"]
+                )
         judge_path = task_dir / "tests" / "llm_rubric_judge.py"
         if judge_path.is_file():
             judge_text = judge_path.read_text(encoding="utf-8")
             for required in (
                 'api_key = env_value("JUDGE_LLM_API_KEY")',
                 'base_url = env_value("JUDGE_LLM_BASE_URL")',
+                "def score_rubric_tree(",
+                "def grade_leaf_requests(",
+                "ThreadPoolExecutor",
+                'parser.add_argument("--submission-validation", type=Path, required=True)',
+                'parser_invalid_reason = "leaf score must be exactly 0 or 1"',
             ):
                 if required not in judge_text:
                     errors.append(f"{task_id}: judge is missing {required}")
             if '"temperature"' in judge_text or "'temperature'" in judge_text:
                 errors.append(f"{task_id}: judge sends unsupported temperature")
+        test_script_path = task_dir / "tests" / "test.sh"
+        if test_script_path.is_file():
+            test_script_text = test_script_path.read_text(encoding="utf-8")
+            for required in (
+                "MAX_COMMITTED_BYTES = 1_000_000_000",
+                'git -C "${CLEAN_SUBMISSION_DIR}" clean -fd',
+                '"tracked_worktree_clean"',
+                '"committed_size_ok"',
+                '--submission-validation "${LOGS_DIR}/preflight.json"',
+                '--submission-dir "${CLEAN_SUBMISSION_DIR}"',
+            ):
+                if required not in test_script_text:
+                    errors.append(f"{task_id}: verifier is missing {required}")
         for path in [task_dir, *task_dir.rglob("*")]:
             mode = stat.S_IMODE(path.stat().st_mode)
             expected = 0o755 if path.is_dir() or path.relative_to(task_dir).as_posix() in {
@@ -804,8 +1014,16 @@ def validate_harbor_batch(
         metadata_path = task_dir / "resource_metadata.json"
         if metadata_path.is_file():
             resource = read_json(metadata_path)
-            if resource.get("schema_version") != "harbor_resource_metadata_v1":
+            if resource.get("schema_version") != HARBOR_RESOURCE_METADATA_VERSION:
                 errors.append(f"{task_id}: invalid resource metadata schema")
+            estimate = resource.get("resource_estimate", {})
+            if estimate.get("gpu_tier") != HARBOR_GPU_TYPE:
+                errors.append(f"{task_id}: resource metadata GPU tier is not {HARBOR_GPU_TYPE}")
+            if estimate.get("gpu_required") is not True or estimate.get("gpu_count") != 1:
+                errors.append(f"{task_id}: resource metadata must require one GPU")
+            estimator = resource.get("estimator", {})
+            if estimator.get("declared_gpu_tier") != HARBOR_GPU_TYPE:
+                errors.append(f"{task_id}: estimator GPU tier is not {HARBOR_GPU_TYPE}")
             current = build_data_profile(task_dir)
             if resource.get("data_profile") != current:
                 errors.append(f"{task_id}: resource data profile does not match task files")
@@ -824,13 +1042,18 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--instructions-file",
         type=Path,
-        default=OFFICIAL_PAPERBENCH_INSTRUCTIONS,
-        help="pinned official PaperBench instructions used as the base for Harbor path/runtime adaptation",
+        help="override the mode-specific pinned official PaperBench instructions",
+    )
+    parser.add_argument(
+        "--rubric-mode",
+        choices=("regular", "code-dev"),
+        default="regular",
+        help="regular grades implementation/execution/results; code-dev grades implementation only",
     )
     parser.add_argument("--require-approved", action="store_true")
     parser.add_argument("--overwrite", action="store_true")
     parser.add_argument("--judge-model", default="gpt-5.5")
-    parser.add_argument("--timeout-sec", type=int, default=605500)
+    parser.add_argument("--timeout-sec", type=int, default=606100)
     parser.add_argument(
         "--reproduction-timeout-sec",
         type=int,
@@ -842,6 +1065,12 @@ def parse_args() -> argparse.Namespace:
         type=int,
         default=600,
         help="single LLM judge request timeout; the judge does not retry timeouts",
+    )
+    parser.add_argument(
+        "--judge-max-workers",
+        type=int,
+        default=100,
+        help="maximum concurrent per-leaf LLM judge requests; defaults to official PaperBench's 100",
     )
     parser.add_argument(
         "--docker-image",
@@ -863,16 +1092,30 @@ def main() -> None:
     template = (args.template_task or default_template_task()).resolve()
     validate_template(template)
     old_title = template_title(template)
-    instructions_file = args.instructions_file.resolve()
+    instructions_file = (
+        args.instructions_file
+        or (
+            OFFICIAL_PAPERBENCH_CODE_DEV_INSTRUCTIONS
+            if args.rubric_mode == "code-dev"
+            else OFFICIAL_PAPERBENCH_INSTRUCTIONS
+        )
+    ).resolve()
     if not instructions_file.is_file():
         raise FileNotFoundError(f"PaperBench instructions file is missing: {instructions_file}")
     if args.timeout_sec <= 0 or args.reproduction_timeout_sec <= 0 or args.judge_request_timeout_sec <= 0:
         raise ValueError("all timeout values must be positive")
-    if args.reproduction_timeout_sec + args.judge_request_timeout_sec + 60 > args.timeout_sec:
+    if args.judge_max_workers <= 0:
+        raise ValueError("--judge-max-workers must be positive")
+    required_timeout = args.judge_request_timeout_sec + 60
+    if args.rubric_mode != "code-dev":
+        required_timeout += args.reproduction_timeout_sec
+    if required_timeout > args.timeout_sec:
         raise ValueError(
-            "--timeout-sec must leave at least 60 seconds beyond reproduction and judge request budgets"
+            "--timeout-sec must leave at least 60 seconds beyond enabled verifier budgets"
         )
-    instructions_content = render_harbor_instructions(instructions_file)
+    instructions_content = render_harbor_instructions(
+        instructions_file, rubric_mode=args.rubric_mode
+    )
     output_parent = args.output_parent.resolve()
     output_parent.mkdir(parents=True, exist_ok=True)
     final_dir = output_parent / batch_id
@@ -905,8 +1148,10 @@ def main() -> None:
                 timeout_sec=args.timeout_sec,
                 reproduction_timeout_sec=args.reproduction_timeout_sec,
                 judge_request_timeout_sec=args.judge_request_timeout_sec,
+                judge_max_workers=args.judge_max_workers,
                 docker_image=args.docker_image,
                 instructions_content=instructions_content,
+                rubric_mode=args.rubric_mode,
             )
             rows.append(
                 manifest_row(
@@ -930,6 +1175,7 @@ def main() -> None:
             staging,
             instructions_content=instructions_content,
             template_task=template,
+            rubric_mode=args.rubric_mode,
         )
         if not report["valid"]:
             raise RuntimeError("invalid Harbor batch:\n- " + "\n- ".join(report["errors"]))

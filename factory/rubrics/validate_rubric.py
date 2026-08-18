@@ -17,6 +17,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--root", type=Path, default=project_root)
     parser.add_argument("--paper", action="append", dest="paper_ids")
     parser.add_argument("--packages", action="store_true", help="validate complete paper directories")
+    parser.add_argument(
+        "--rubric-mode", choices=("regular", "code-dev"), default="regular"
+    )
     parser.add_argument("--report", type=Path, help="write the combined JSON report")
     parser.add_argument("--fail-on-warning", action="store_true")
     return parser.parse_args()
@@ -36,10 +39,10 @@ def main() -> None:
         package_mode = args.packages or target.is_dir()
         if package_mode:
             paper_dir = target if target.is_dir() else target.parent
-            report = validate_package(paper_dir)
+            report = validate_package(paper_dir, rubric_mode=args.rubric_mode)
             label = paper_dir.name
         else:
-            report = validate_rubric(load_json(target))
+            report = validate_rubric(load_json(target), rubric_mode=args.rubric_mode)
             report["path"] = str(target)
             label = target.parent.name + "/" + target.name
         reports.append(report)
