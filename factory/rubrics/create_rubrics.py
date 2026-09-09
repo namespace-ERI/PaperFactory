@@ -16,6 +16,7 @@ import os
 import re
 import shutil
 import ssl
+import sys
 import time
 import urllib.error
 import urllib.request
@@ -42,17 +43,24 @@ cannot be established, put it in unresolved_questions instead of guessing. Outpu
 
 
 def rubric_mode_guidance(rubric_mode: str) -> str:
+    official_categories = (
+        "Use the official PaperBench leaf boundary: Code Development asks whether the submitted "
+        "code contains the correct implementation; Code Execution asks whether running "
+        "reproduce.sh successfully executes it; Result Analysis asks whether that execution "
+        "produces evidence agreeing with the paper's result. Categorize each leaf by that "
+        "evidence question, without adding factory-specific requirements."
+    )
     if rubric_mode == "code-dev":
         return (
             "CODE-DEV OUTPUT MODE: first author and locally weight the complete normal PaperBench "
             "rubric. The pipeline will then deterministically apply the official TaskNode.code_only() "
             "projection: retain Code Development leaves and their ancestors, preserve retained node "
             "weights, and remove Code Execution / Result Analysis leaves. Do not independently reweight "
-            "the projected tree."
+            f"the projected tree. {official_categories}"
         )
     return (
         "REGULAR MODE: author the normal PaperBench rubric. Distinguish Code Development, Code "
-        "Execution, and Result Analysis evidence where scientifically relevant."
+        f"Execution, and Result Analysis evidence where scientifically relevant. {official_categories}"
     )
 
 COMPLETE_AUTHORING_FILES = (
@@ -65,6 +73,7 @@ COMPLETE_AUTHORING_FILES = (
     "rubric_weight_application.json",
     "rubric.draft.json",
     "quality_review.json",
+    "unresolved_questions.json",
     "validation_report.json",
     "authoring_provenance.json",
 )
@@ -137,7 +146,22 @@ class OpenAICompatibleClient(JSONModelClient):
                 with urllib.request.urlopen(
                     request, timeout=self.timeout, context=ssl.create_default_context()
                 ) as response:
-                    raw = json.loads(response.read().decode("utf-8"))
+                    body = response.read()
+                    status = getattr(response, "status", None)
+                    content_type = response.headers.get("Content-Type", "")
+                if not body.strip():
+                    raise ValueError(
+                        f"{call_name}: upstream returned an empty response "
+                        f"(status={status}, content_type={content_type!r}, bytes={len(body)})"
+                    )
+                try:
+                    raw = json.loads(body.decode("utf-8"))
+                except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+                    raise ValueError(
+                        f"{call_name}: upstream returned a non-JSON response "
+                        f"(status={status}, content_type={content_type!r}, bytes={len(body)}): "
+                        f"{exc}"
+                    ) from exc
                 content = raw["choices"][0]["message"]["content"]
                 if isinstance(content, list):
                     content = "".join(
@@ -302,7 +326,10 @@ def draft_addendum(
 named Scope, Approved adaptations, Required comparisons and evidence, Clarifications, and Out of scope.
 Only state decisions supported by the paper/metadata and already resolved in the matrix. Do not reveal
 rubric weights, gold numbers, hidden tolerances, official-code details, or solution file structure.
-If necessary completion information is unresolved, omit the guess and list it in unresolved_questions.
+Use one internally consistent definition for every method, feature, metric, dataset, and resource across
+all sections. If an exact reconstruction detail is unavailable but the scoped task can accept a documented
+reasonable choice, state that adaptation explicitly. Otherwise omit the guess and list the necessary
+information in unresolved_questions; never claim that an unresolved choice has an official resolution.
 {rubric_mode_guidance(rubric_mode)}
 Return {{"addendum_markdown": "...", "unresolved_questions": [{{"question":"...","blocking":true}}]}}.
 
@@ -333,8 +360,9 @@ def plan_rubric_tree(
     )
     prompt = f"""Design only the top-level rubric tree skeleton for {paper_id}, following the supplied
 Chinese authoring guide. Do not write leaf nodes yet. Organize branches by scientific contribution rather
-than source files or paper page order. Every included core contribution must map to a branch; add a small
-reproduction-interface/evidence branch only if needed. Allocate a leaf budget totaling roughly
+than source files or paper page order. Every included core contribution must map to a branch. Do not add a
+generic reproduction-interface branch: the standard instruction already defines the required entry point,
+and execution/artifact evidence belongs under the scientific contribution it supports. Allocate a leaf budget totaling roughly
 {target_leaves}, adapting downward for a simple scoped task. Preliminary sibling weights must be 1/2/3.
 
 {rubric_mode_guidance(rubric_mode)}
@@ -418,7 +446,12 @@ def expand_rubric_subtrees(
 complete subtree. Recursively decompose it until every leaf checks one observable, binary condition that
 an expert can judge in about 15 minutes. Follow the selected mode's category boundary exactly. In regular
 mode, Result Analysis leaves need a declared comparison, trend, or tolerance; never invent a tolerance
-that needs a gold run. Avoid implementation lock-in and duplicate scoring. Prefix descendant IDs with
+that needs a gold run. Do not create a toy or sanity-check Execution/Result criterion unless the paper
+contains that experiment or the public addendum explicitly defines it as an accepted reproduction proxy.
+Each leaf must contain one independently passable condition; split requirements joined by independent
+"and" clauses into sibling leaves. If a necessary fact is absent, require a documented reasonable choice
+through the public addendum instead of claiming that the paper fixed one. Avoid implementation lock-in and
+duplicate scoring. Prefix descendant IDs with
 `{branch_id}-` so IDs remain globally unique.
 
 Every node must contain exactly id, requirements, weight, sub_tasks, task_category,
@@ -486,6 +519,7 @@ def plan_rubric_weights(
     matrix: dict[str, Any],
     rubric: dict[str, Any],
     rubric_mode: str,
+    call_name: str = "weighting",
 ) -> dict[str, Any]:
     importance_guidance = (
         "The paper's most central implementation responsibilities should dominate globally; supporting "
@@ -498,7 +532,9 @@ def plan_rubric_weights(
 rubric tree. Weight scientific importance, not implementation difficulty or compute cost. Use only integer
 weights 1/2/3 (root must remain 1). {importance_guidance} Inspect path-normalized
 effective weights and avoid letting a branch with many leaves dominate merely by node count. Do not alter
-IDs, requirements, categories, or tree structure.
+IDs, requirements, categories, or tree structure. A supporting sanity, orchestration, or infrastructure
+leaf must not outweigh a primary method or primary-result leaf merely because it sits in a shallower or
+smaller branch.
 
 {rubric_mode_guidance(rubric_mode)}
 
@@ -508,7 +544,7 @@ Return {{"weights": [{{"node_id": "...", "weight": 1, "rationale": "..."}}],
 
 <contribution_evidence_matrix>{json_block(matrix)}</contribution_evidence_matrix>
 <assembled_tree>{json_block(rubric)}</assembled_tree>"""
-    return client.complete(call_name="weighting", system=SYSTEM_PROMPT, user=prompt)
+    return client.complete(call_name=call_name, system=SYSTEM_PROMPT, user=prompt)
 
 
 def apply_weight_plan(
@@ -569,6 +605,7 @@ def review_drafts(
     client: JSONModelClient,
     *,
     paper_id: str,
+    paper_text: str,
     matrix: dict[str, Any],
     addendum: str,
     rubric: dict[str, Any],
@@ -578,15 +615,28 @@ def review_drafts(
     prompt = f"""Act as a second independent PaperBench rubric reviewer for {paper_id}. Audit fidelity
 to cited paper claims, core-claim coverage, atomicity, observable evidence, implementation/execution/result
 boundaries appropriate to the selected mode, addendum/rubric responsibility, tolerance invention, double counting, effective weight balance,
-and feasibility. A structurally valid tree may still fail this review. Do not silently fix issues.
+and feasibility. Explicitly check that the contribution matrix, public addendum, and every rubric leaf
+are mutually consistent. Reject toy or sanity-check Execution/Result criteria unless the paper itself
+contains that experiment or the public addendum explicitly establishes it as a valid reproduction proxy.
+Reject generic reproduction-interface leaves that duplicate paper-specific implementation, execution, or
+result criteria. A structurally valid tree may still fail this review. Do not silently fix issues.
+The complete paper text is provided below; do not claim that the paper is unavailable. Reserve
+blocking_issues for defects that make a leaf or the benchmark scientifically invalid or unscorable.
+Every unresolved question must be an object with location, question, blocking, rationale, and
+recommended_action. Set blocking=true only when the missing answer prevents valid binary grading or
+scientifically faithful task construction. Human verification, licensing, infrastructure availability,
+gold-run calibration, and other follow-up checks that do not prevent valid candidate-side binary grading
+must use blocking=false and may also be listed in warnings or human_review_checklist.
 
 {rubric_mode_guidance(rubric_mode)}
 
 Return {{"blocking_issues": [{{"location":"...","issue":"...","recommended_action":"..."}}],
     "warnings": [], "coverage_gaps": [], "possible_double_counting": [],
-    "unresolved_questions": [], "human_review_checklist": [],
+    "unresolved_questions": [{{"location":"...","question":"...","blocking":false,
+        "rationale":"...","recommended_action":"..."}}], "human_review_checklist": [],
     "judge_addendum": {{"needed": false, "reasons": [], "allowed_content": []}}}}.
 
+<paper id="{paper_id}">{paper_text}</paper>
 <matrix>{json_block(matrix)}</matrix>
 <addendum>{addendum}</addendum>
 <rubric>{json_block(rubric)}</rubric>
@@ -602,13 +652,19 @@ def draft_judge_addendum(
     rubric: dict[str, Any],
     review: dict[str, Any],
 ) -> dict[str, Any]:
-    prompt = f"""Draft an optional judge-only addendum for {paper_id}. Include only grading-side
-disambiguation such as equivalent evidence formats, artifact provenance checks, or how to distinguish
-closely related rubric conditions. Never hide information that a candidate needs to complete the task,
-never include solution code, and never compensate for an incomplete public addendum. If any requested
-topic belongs in the public addendum, report it in unresolved_questions and omit it here.
+    prompt = f"""Draft an optional judge-only addendum for {paper_id}. Include only task-specific
+grading clarifications that are explicitly supported by the paper or public addendum. Do not add a
+factory-wide judging policy, relax or expand a rubric criterion, or introduce an equivalence allowance
+that the authored task does not state. Never hide information that a candidate needs to complete the
+task, never include solution code, and never compensate for an incomplete public addendum. If any
+requested topic belongs in the public addendum, report it in unresolved_questions and omit it here.
+Every scored leaf is binary: never instruct the judge to award partial, fractional, or proportional
+credit within one leaf. Partial coverage must be represented by separate sibling leaves in the rubric.
 
-Return {{"judge_addendum_markdown": "...", "unresolved_questions": []}}.
+Return {{"judge_addendum_markdown": "...", "unresolved_questions":
+[{{"location":"...","question":"...","blocking":false,"rationale":"...",
+"recommended_action":"..."}}]}}. Use blocking=true only if the issue prevents valid binary grading;
+ordinary human-review follow-up is non-blocking.
 
 <public_addendum>{addendum}</public_addendum>
 <rubric>{json_block(rubric)}</rubric>
@@ -640,6 +696,66 @@ paper locators, and intended scope. Do not resolve missing facts by guessing. Re
     )
 
 
+def repair_reviewed_drafts(
+    client: JSONModelClient,
+    *,
+    paper_id: str,
+    paper_text: str,
+    matrix: dict[str, Any],
+    addendum: str,
+    full_rubric: dict[str, Any],
+    validation: dict[str, Any],
+    review: dict[str, Any],
+    round_number: int,
+    rubric_mode: str,
+) -> dict[str, Any]:
+    prompt = f"""Repair every blocking issue identified by the independent PaperBench review for
+{paper_id}. Return the complete contribution-evidence matrix, the complete regular rubric tree, and the
+complete public addendum. The matrix, addendum, and rubric must express one consistent benchmark scope
+and policy. Preserve correct paper-specific content, cited scope, and the official three evidence
+categories. Do not invent missing
+facts, numeric tolerances, proxy experiments, or implementation requirements. When the paper omits a
+necessary reconstruction detail, the public addendum may require the submitter to make and document a
+reasonable choice; classify that choice consistently in the matrix, and do not pretend that one unstated
+choice is official. Remove duplicate
+scoring and split independently passable conditions into atomic sibling leaves. Rebalance local sibling
+weights according to scientific importance only after the repaired structure is complete; do not flatten
+the tree or change PaperBench's recursive scoring semantics.
+
+Before returning, audit the entire corrected artifact set—not only the issues named in the latest review—
+for the same fidelity, coverage, atomicity, observability, evidence-boundary, double-counting, effective-
+weight, and feasibility criteria used by the independent reviewer. In particular, every Result Analysis
+leaf must be supported by an observable artifact required by a Code Execution leaf, paper-level execution
+requirements must not be satisfiable with an unapproved toy run or intentionally weak baseline, and
+cross-cutting interpretation must not duplicate or dominate the paper's core implementation and empirical
+evidence. Resolve reconstruction choices consistently through the public addendum instead of returning
+questions that the paper does not answer. Repair blocking_issues and unresolved questions explicitly
+marked blocking=true. Do not invent facts merely to clear non-blocking human-review questions; preserve
+those as blocking=false audit notes when they remain useful. The complete paper text is included below,
+so use it as the factual source for every fidelity decision.
+
+The returned rubric must remain a complete regular PaperBench tree even when the requested output mode is
+code-dev; code-dev is derived later by deterministic official pruning.
+
+Return {{"contribution_evidence_matrix": <complete corrected matrix>,
+"rubric": <complete corrected regular tree>, "addendum_markdown": "...",
+"unresolved_questions": [], "changes": []}}.
+
+{rubric_mode_guidance(rubric_mode)}
+
+<paper id="{paper_id}">{paper_text}</paper>
+<contribution_evidence_matrix>{json_block(matrix)}</contribution_evidence_matrix>
+<current_public_addendum>{addendum}</current_public_addendum>
+<current_complete_rubric>{json_block(full_rubric)}</current_complete_rubric>
+<automatic_validation>{json_block(validation)}</automatic_validation>
+<independent_review>{json_block(review)}</independent_review>"""
+    return client.complete(
+        call_name=f"semantic-repair-{round_number:02d}",
+        system=SYSTEM_PROMPT,
+        user=prompt,
+    )
+
+
 def unresolved_from(*values: Any) -> list[Any]:
     found: list[Any] = []
     seen: set[str] = set()
@@ -657,6 +773,37 @@ def unresolved_from(*values: Any) -> list[Any]:
     return found
 
 
+def blocking_unresolved_from(*values: Any) -> list[dict[str, Any]]:
+    """Return only questions that explicitly declare themselves export-blocking."""
+    return [
+        item
+        for item in unresolved_from(*values)
+        if isinstance(item, dict) and item.get("blocking") is True
+    ]
+
+
+def review_blocking_issues(review: Any) -> list[Any]:
+    """Normalize hard reviewer failures while keeping malformed review output fail-closed."""
+    if not isinstance(review, dict):
+        return [
+            {
+                "location": "quality review",
+                "issue": "quality review is not an object",
+                "recommended_action": "return the required review schema",
+            }
+        ]
+    issues = review.get("blocking_issues", [])
+    if isinstance(issues, list):
+        return issues
+    return [
+        {
+            "location": "quality review",
+            "issue": "blocking_issues is not an array",
+            "recommended_action": "return the required review schema",
+        }
+    ]
+
+
 def author_one(args: argparse.Namespace, paper_id: str, guide: str) -> None:
     project_root = args.root.resolve()
     paper_dir = project_root / "paper_sources" / paper_id
@@ -668,6 +815,26 @@ def author_one(args: argparse.Namespace, paper_id: str, guide: str) -> None:
                 provenance = load_json(output_dir / "authoring_provenance.json")
                 existing_mode = provenance.get("rubric_mode", "regular")
                 if existing_mode != args.rubric_mode:
+                    if args.rubric_mode == "code-dev" and existing_mode == "regular":
+                        existing_rubric = load_json(output_dir / "rubric.draft.json")
+                        rubric_report = validate_rubric(existing_rubric)
+                        addendum_report = validate_addendum(
+                            (output_dir / "addendum.draft.md").read_text(encoding="utf-8")
+                        )
+                        if not rubric_report["valid"] or not addendum_report["valid"]:
+                            problems = [
+                                *rubric_report.get("errors", []),
+                                *addendum_report.get("errors", []),
+                            ]
+                            raise FileExistsError(
+                                f"{paper_id}: existing regular rubric cannot be reused for "
+                                "official Code-Dev pruning:\n- " + "\n- ".join(problems)
+                            )
+                        print(
+                            f"{paper_id}: complete regular rubric exists; resume reuses it "
+                            "as the source for official Code-Dev pruning"
+                        )
+                        return
                     raise FileExistsError(
                         f"{paper_id}: existing rubric mode is {existing_mode!r}, requested "
                         f"{args.rubric_mode!r}; use --overwrite to regenerate"
@@ -851,37 +1018,74 @@ def author_one(args: argparse.Namespace, paper_id: str, guide: str) -> None:
         rubric = normalize_rubric(repaired["rubric"])
         validation = validate_rubric(rubric, rubric_mode=authoring_mode)
 
-    # Re-apply and re-audit the explicit weight plan after any structural repair.
-    rubric, weight_application = apply_weight_plan(rubric, weight_plan)
-    write_json(output_dir / "rubric_weight_application.json", weight_application)
-    full_rubric = rubric
-    full_validation = validate_rubric(full_rubric, rubric_mode=authoring_mode)
-    if args.rubric_mode == "code-dev":
-        write_json(output_dir / "rubric.full.draft.json", full_rubric)
-        rubric = paperbench_code_only_rubric(full_rubric)
-    validation = validate_rubric(rubric, rubric_mode=args.rubric_mode)
-    validation["tree_construction"] = {
-        "planned_branches": len(branches),
-        "generated_subtrees": len(subtree_results),
-        "weight_application": weight_application,
-        "complete_rubric_validation": full_validation,
-        "code_dev_derivation": (
-            CODE_DEV_DERIVATION
+    # A structural repair may add or remove nodes. Re-run the explicit local
+    # weighting stage instead of silently applying a stale plan to a new tree.
+    if repair_results:
+        weight_plan = plan_rubric_weights(
+            client,
+            paper_id=paper_id,
+            matrix=matrix,
+            rubric=rubric,
+            rubric_mode=authoring_mode,
+            call_name="weighting-after-structural-repair",
+        )
+        write_json(output_dir / "rubric_weight_plan.json", weight_plan)
+    full_rubric, weight_application = apply_weight_plan(rubric, weight_plan)
+
+    def derive_and_validate(
+        complete_tree: dict[str, Any], application: dict[str, Any]
+    ) -> tuple[dict[str, Any], dict[str, Any], dict[str, Any]]:
+        complete_validation = validate_rubric(
+            complete_tree, rubric_mode=authoring_mode
+        )
+        selected_tree = (
+            paperbench_code_only_rubric(complete_tree)
             if args.rubric_mode == "code-dev"
-            else None
-        ),
-    }
+            else complete_tree
+        )
+        selected_validation = validate_rubric(
+            selected_tree, rubric_mode=args.rubric_mode
+        )
+        selected_validation["tree_construction"] = {
+            "planned_branches": len(branches),
+            "generated_subtrees": len(subtree_results),
+            "weight_application": application,
+            "complete_rubric_validation": complete_validation,
+            "code_dev_derivation": (
+                CODE_DEV_DERIVATION
+                if args.rubric_mode == "code-dev"
+                else None
+            ),
+        }
+        return selected_tree, selected_validation, complete_validation
+
+    rubric, validation, full_validation = derive_and_validate(
+        full_rubric, weight_application
+    )
 
     print(f"{paper_id}: running independent quality review")
     review = review_drafts(
         client,
         paper_id=paper_id,
+        paper_text=paper_text,
         matrix=matrix,
         addendum=addendum,
         rubric=rubric,
         validation=validation,
         rubric_mode=args.rubric_mode,
     )
+
+    # The independent LLM review is an audit artifact, not part of official
+    # PaperBench's deterministic rubric validation or scoring semantics.  Do
+    # not let reviewer drift repeatedly rewrite an already-valid tree through
+    # repair -> reweight -> rereview cycles.  Structural repair remains above;
+    # semantic findings are preserved for later human inspection.
+    semantic_repair_results: list[dict[str, Any]] = []
+
+    write_json(output_dir / "rubric_weight_plan.json", weight_plan)
+    write_json(output_dir / "rubric_weight_application.json", weight_application)
+    if args.rubric_mode == "code-dev":
+        write_json(output_dir / "rubric.full.draft.json", full_rubric)
 
     judge_addendum_result: dict[str, Any] = {}
     judge_addendum_spec = review.get("judge_addendum", {})
@@ -903,16 +1107,9 @@ def author_one(args: argparse.Namespace, paper_id: str, guide: str) -> None:
         write_json(output_dir / "judge_addendum_generation.json", judge_addendum_result)
 
     addendum_validation = validate_addendum(addendum)
-    unresolved = unresolved_from(
-        matrix,
-        addendum_result,
-        tree_plan,
-        weight_plan,
-        *subtree_results,
-        review,
-        judge_addendum_result,
-        *repair_results,
-    )
+    unresolved = unresolved_from(review, judge_addendum_result)
+    blocking_unresolved = blocking_unresolved_from(review, judge_addendum_result)
+    (output_dir / "addendum.draft.md").write_text(addendum, encoding="utf-8")
     write_json(output_dir / "rubric.draft.json", rubric)
     write_json(output_dir / "quality_review.json", review)
     write_json(output_dir / "unresolved_questions.json", unresolved)
@@ -920,6 +1117,29 @@ def author_one(args: argparse.Namespace, paper_id: str, guide: str) -> None:
         output_dir / "validation_report.json",
         {"rubric": validation, "addendum": addendum_validation},
     )
+    remaining_blockers = review_blocking_issues(review)
+    if (
+        not validation["valid"]
+        or not full_validation["valid"]
+        or not addendum_validation["valid"]
+        or not weight_application.get("valid")
+    ):
+        failure = {
+            "paper_id": paper_id,
+            "structural_errors": validation.get("errors", []),
+            "complete_tree_errors": full_validation.get("errors", []),
+            "addendum_errors": addendum_validation.get("errors", []),
+            "weight_errors": weight_application.get("errors", []),
+            "blocking_issues": remaining_blockers,
+            "blocking_unresolved_questions": blocking_unresolved,
+            "unresolved_questions": unresolved,
+            "semantic_repair_rounds_run": len(semantic_repair_results),
+        }
+        write_json(output_dir / "authoring_failure.json", failure)
+        raise RuntimeError(
+            f"{paper_id}: rubric artifacts failed deterministic validation; "
+            "refusing Harbor export"
+        )
     write_json(
         output_dir / "authoring_provenance.json",
         {
@@ -956,6 +1176,8 @@ def author_one(args: argparse.Namespace, paper_id: str, guide: str) -> None:
             ],
             "target_leaves": args.target_leaves,
             "repair_rounds_run": len(repair_results),
+            "semantic_repair_rounds_run": len(semantic_repair_results),
+            "nonblocking_unresolved_questions": len(unresolved) - len(blocking_unresolved),
             "status": "draft-needs-human-review",
         },
     )
@@ -963,7 +1185,8 @@ def author_one(args: argparse.Namespace, paper_id: str, guide: str) -> None:
         f"{paper_id}: draft complete: {validation['stats'].get('leaves', 0)} leaves, "
         f"{len(validation['errors'])} structural errors, "
         f"{len(review.get('blocking_issues', []))} review blockers, "
-        f"{len(unresolved)} unresolved questions"
+        f"{len(blocking_unresolved)} blocking and "
+        f"{len(unresolved) - len(blocking_unresolved)} non-blocking unresolved questions"
     )
 
 
@@ -1005,7 +1228,64 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="skip complete authoring directories and restart incomplete generated drafts",
     )
+    parser.add_argument(
+        "--continue-on-error",
+        action="store_true",
+        help="record a failed paper and continue authoring the remaining selected papers",
+    )
     return parser.parse_args()
+
+
+def author_papers(
+    args: argparse.Namespace, paper_ids: list[str], guide: str
+) -> dict[str, str]:
+    """Author all selected papers, optionally isolating failures per paper."""
+    failures: dict[str, str] = {}
+
+    def handle_failure(paper_id: str, exc: Exception) -> None:
+        if not args.continue_on_error:
+            raise exc
+        failures[paper_id] = f"{type(exc).__name__}: {exc}"
+        print(
+            f"{paper_id}: rubric authoring failed; skipping this paper and continuing: "
+            f"{failures[paper_id]}",
+            file=sys.stderr,
+            flush=True,
+        )
+
+    if args.paper_workers == 1 or len(paper_ids) <= 1:
+        for paper_id in paper_ids:
+            try:
+                author_one(args, paper_id, guide)
+            except Exception as exc:
+                handle_failure(paper_id, exc)
+    else:
+        with concurrent.futures.ThreadPoolExecutor(
+            max_workers=min(args.paper_workers, len(paper_ids))
+        ) as executor:
+            futures = {
+                executor.submit(author_one, args, paper_id, guide): paper_id
+                for paper_id in paper_ids
+            }
+            for future in concurrent.futures.as_completed(futures):
+                paper_id = futures[future]
+                try:
+                    future.result()
+                except Exception as exc:
+                    if not args.continue_on_error:
+                        raise RuntimeError(
+                            f"parallel rubric authoring failed for {paper_id}"
+                        ) from exc
+                    handle_failure(paper_id, exc)
+
+    if failures:
+        print(
+            "rubric authoring completed with skipped papers: "
+            + ", ".join(failures),
+            file=sys.stderr,
+            flush=True,
+        )
+    return failures
 
 
 def main() -> None:
@@ -1023,23 +1303,7 @@ def main() -> None:
     for paper_id in paper_ids:
         if not re.fullmatch(r"[a-z0-9]+(?:-[a-z0-9]+)*", paper_id):
             raise ValueError(f"invalid paper id: {paper_id}")
-    if args.paper_workers == 1 or len(paper_ids) <= 1:
-        for paper_id in paper_ids:
-            author_one(args, paper_id, guide)
-    else:
-        with concurrent.futures.ThreadPoolExecutor(
-            max_workers=min(args.paper_workers, len(paper_ids))
-        ) as executor:
-            futures = {
-                executor.submit(author_one, args, paper_id, guide): paper_id
-                for paper_id in paper_ids
-            }
-            for future in concurrent.futures.as_completed(futures):
-                paper_id = futures[future]
-                try:
-                    future.result()
-                except Exception as exc:
-                    raise RuntimeError(f"parallel rubric authoring failed for {paper_id}") from exc
+    author_papers(args, paper_ids, guide)
 
 
 if __name__ == "__main__":

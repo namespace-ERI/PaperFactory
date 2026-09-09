@@ -22,7 +22,7 @@
         }
       ],
       "compute": {
-        "accelerator": "1 x NVIDIA H200 120GB",
+        "accelerator": "1 x NVIDIA H200",
         "max_wall_time_hours": 24
       }
     }

@@ -13,7 +13,10 @@ import hashlib
 import json
 import re
 import shutil
+import stat
 import subprocess
+import sys
+import tarfile
 import tempfile
 import time
 import unicodedata
@@ -21,8 +24,8 @@ import urllib.error
 import urllib.parse
 import urllib.request
 from html.parser import HTMLParser
-from pathlib import Path
-from typing import Any, Iterable
+from pathlib import Path, PurePosixPath
+from typing import Any, Callable, Iterable
 
 
 USER_AGENT = "PaperBench-task-factory/1.0"
@@ -33,6 +36,33 @@ HTML_BLOCK_TAGS = {
     "footer", "h1", "h2", "h3", "h4", "h5", "h6", "header", "li", "main",
     "ol", "p", "pre", "section", "table", "td", "th", "tr", "ul",
 }
+MARKDOWN_ASSET_RE = re.compile(
+    r"!\[[^\]]*\]\(\s*<?(?P<path>(?:\./)?assets/[^)>\s]+)>?"
+    r"(?:\s+(?:\"[^\"]*\"|'[^']*'))?\s*\)"
+)
+HTML_ASSET_RE = re.compile(
+    r"<img\b[^>]*\bsrc\s*=\s*([\"'])"
+    r"(?P<path>(?:\./)?assets/[^\"']+)\1[^>]*>",
+    re.IGNORECASE,
+)
+IMAGE_SUFFIXES = {".gif", ".jpeg", ".jpg", ".png", ".svg", ".webp"}
+IMAGE_MIME_SUFFIXES = {
+    "image/gif": ".gif",
+    "image/jpeg": ".jpg",
+    "image/png": ".png",
+    "image/svg+xml": ".svg",
+    "image/webp": ".webp",
+}
+LATEX_GRAPHIC_SUFFIXES = (".pdf", ".png", ".jpg", ".jpeg", ".svg", ".eps", ".ps")
+LATEX_FIGURE_RE = re.compile(
+    r"\\begin\{figure\*?\}(?P<body>.*?)\\end\{figure\*?\}", re.DOTALL
+)
+LATEX_INCLUDEGRAPHICS_RE = re.compile(
+    r"\\includegraphics(?:\s*\[[^\]]*\])?\s*\{(?P<path>[^}]+)\}"
+)
+LATEX_CAPTION_RE = re.compile(
+    r"\\caption(?:\s*\[[^\]]*\])?\s*\{(?P<caption>.*?)\}", re.DOTALL
+)
 
 
 def sha256(path: Path) -> str:
@@ -50,6 +80,23 @@ def write_text(path: Path, value: str) -> None:
 
 def json_dump(path: Path, value: Any) -> None:
     write_text(path, json.dumps(value, ensure_ascii=False, indent=2) + "\n")
+
+
+def normalize_paper_package_permissions(paper_dir: Path) -> None:
+    """Keep materialized paper inputs readable by later Harbor conversion.
+
+    ``shutil.copy2`` intentionally preserves the mode of a local source.  A
+    source PDF or asset with mode 0600 can therefore become unreadable when a
+    later factory stage runs under a different uid.  Paper packages contain
+    public benchmark inputs, so normalize directories to 0755 and files to
+    0644 after materialization and when reusing an existing package.
+    """
+    if not paper_dir.exists():
+        return
+    for path in [paper_dir, *paper_dir.rglob("*")]:
+        expected = 0o755 if path.is_dir() else 0o644
+        if stat.S_IMODE(path.stat().st_mode) != expected:
+            path.chmod(expected)
 
 
 def resolve_path(value: str | Path, base: Path) -> Path:
@@ -132,6 +179,25 @@ def validate_entries(entries: list[dict[str, Any]]) -> None:
         blacklist = entry.get("blacklist")
         if blacklist is not None and not isinstance(blacklist, (str, list)):
             errors.append(f"{label}: blacklist must be a string or list of strings")
+        asset_files = entry.get("asset_files")
+        assets_source = source_value(entry, ("assets_path", "paper_assets"))
+        if asset_files is not None and (
+            not isinstance(asset_files, list)
+            or not all(isinstance(value, str) and value.strip() for value in asset_files)
+        ):
+            errors.append(f"{label}: asset_files must be a list of non-empty relative paths")
+        elif isinstance(asset_files, list):
+            try:
+                normalize_asset_files(entry)
+            except ValueError as exc:
+                errors.append(f"{label}: {exc}")
+            if asset_files and not assets_source:
+                errors.append(f"{label}: non-empty asset_files requires assets_path or paper_assets")
+        if assets_source and asset_files is None:
+            errors.append(
+                f"{label}: assets_path/paper_assets requires an explicit asset_files list; "
+                "PaperBench assets are curated necessary resources, not a directory-wide copy"
+            )
     duplicate_ids = sorted({paper_id for paper_id in ids if ids.count(paper_id) > 1})
     if duplicate_ids:
         errors.append(f"duplicate paper ids: {', '.join(duplicate_ids)}")
@@ -145,6 +211,62 @@ def source_value(entry: dict[str, Any], names: Iterable[str]) -> str | None:
         if isinstance(value, str) and value.strip():
             return value.strip()
     return None
+
+
+def normalize_asset_files(entry: dict[str, Any]) -> list[str]:
+    """Return the explicitly curated PaperBench asset allowlist.
+
+    Upstream PaperBench describes ``assets`` as necessary replication
+    resources.  It does not define an automatic file-count or image-size
+    heuristic, so this factory requires task authors to select exact paths.
+    """
+    raw = entry.get("asset_files")
+    if raw is None:
+        return []
+    if not isinstance(raw, list):
+        raise ValueError("asset_files must be a list")
+    selected: list[str] = []
+    for value in raw:
+        if not isinstance(value, str) or not value.strip():
+            raise ValueError("asset_files entries must be non-empty strings")
+        normalized = value.strip().replace("\\", "/")
+        if normalized.startswith("./"):
+            normalized = normalized[2:]
+        if normalized.startswith("assets/"):
+            normalized = normalized[len("assets/") :]
+        path = PurePosixPath(normalized)
+        if path.is_absolute() or not path.parts or any(part in {"", ".", ".."} for part in path.parts):
+            raise ValueError(f"unsafe asset_files path: {value!r}")
+        selected.append(path.as_posix())
+    if len(selected) != len(set(selected)):
+        raise ValueError("asset_files contains duplicate paths")
+    return selected
+
+
+def local_asset_path(reference: str) -> str:
+    normalized = reference.replace("\\", "/")
+    if normalized.startswith("./"):
+        normalized = normalized[2:]
+    return normalized[len("assets/") :] if normalized.startswith("assets/") else normalized
+
+
+def apply_asset_selection(markdown_path: Path, selected: list[str]) -> list[str]:
+    """Remove local image tags for resources not selected by the task author."""
+    text = markdown_path.read_text(encoding="utf-8", errors="replace")
+    selected_set = set(selected)
+    omitted: list[str] = []
+
+    def replace(match: re.Match[str]) -> str:
+        relative = local_asset_path(match.group("path"))
+        if relative in selected_set:
+            return match.group(0)
+        omitted.append(relative)
+        return ""
+
+    text = MARKDOWN_ASSET_RE.sub(replace, text)
+    text = HTML_ASSET_RE.sub(replace, text)
+    markdown_path.write_text(text, encoding="utf-8")
+    return list(dict.fromkeys(omitted))
 
 
 def materialize_source(
@@ -240,10 +362,17 @@ def pdf_to_markdown(pdf_path: Path, markdown_path: Path, source: str) -> str:
 class PaperHTMLTextParser(HTMLParser):
     """Dependency-free article HTML to readable, heading-preserving Markdown."""
 
-    def __init__(self, *, require_article: bool) -> None:
+    def __init__(
+        self,
+        *,
+        require_article: bool,
+        media_resolver: Callable[[str, str | None, str | None], str | None] | None = None,
+    ) -> None:
         super().__init__(convert_charrefs=True)
         self.require_article = require_article
+        self.media_resolver = media_resolver
         self.article_depth = 0
+        self.figure_depth = 0
         self.skip_depth = 0
         self.parts: list[str] = []
 
@@ -258,6 +387,8 @@ class PaperHTMLTextParser(HTMLParser):
             self.article_depth += 1
         if not self.active:
             return
+        if tag == "figure":
+            self.figure_depth += 1
         if tag in {"script", "style", "nav", "noscript"}:
             self.skip_depth += 1
             return
@@ -273,9 +404,16 @@ class PaperHTMLTextParser(HTMLParser):
             latex = attributes.get("alttext")
             if latex:
                 self.parts.append(f" ${latex} ")
-        elif tag == "img":
-            alt = attributes.get("alt")
-            if alt:
+        elif tag in {"img", "object"}:
+            source = attributes.get("src") if tag == "img" else attributes.get("data")
+            alt = attributes.get("alt") or attributes.get("title")
+            mime_type = attributes.get("type")
+            rendered = None
+            if source and self.figure_depth and self.media_resolver:
+                rendered = self.media_resolver(source, alt, mime_type)
+            if rendered:
+                self.parts.append(f"\n{rendered}\n")
+            elif tag == "img" and alt:
                 self.parts.append(f" [{alt}] ")
 
     def handle_endtag(self, tag: str) -> None:
@@ -284,6 +422,8 @@ class PaperHTMLTextParser(HTMLParser):
             self.skip_depth = max(0, self.skip_depth - 1)
         elif self.active and not self.skip_depth and tag in HTML_BLOCK_TAGS:
             self.parts.append("\n")
+        if tag == "figure" and self.figure_depth:
+            self.figure_depth -= 1
         if tag == "article" and self.article_depth:
             self.article_depth -= 1
 
@@ -292,13 +432,60 @@ class PaperHTMLTextParser(HTMLParser):
             self.parts.append(data)
 
 
-def html_to_markdown(html_path: Path, markdown_path: Path, source: str) -> str:
+def media_suffix(source_url: str, mime_type: str | None) -> str | None:
+    suffix = Path(urllib.parse.urlparse(source_url).path).suffix.lower()
+    if suffix in IMAGE_SUFFIXES:
+        return suffix
+    if mime_type:
+        return IMAGE_MIME_SUFFIXES.get(mime_type.split(";", 1)[0].strip().lower())
+    return None
+
+
+def html_to_markdown(
+    html_path: Path,
+    markdown_path: Path,
+    source: str,
+    *,
+    asset_destination: Path | None = None,
+    asset_workers: int = 4,
+) -> tuple[str, list[dict[str, str]], list[str]]:
+    """Convert a paper HTML rendering and materialize its logical figures.
+
+    Official PaperBench markdown references paper figures from ``assets/``.
+    ar5iv/LaTeXML represents those figures as ``img`` or image ``object``
+    elements nested in semantic ``figure`` elements.  We preserve exactly
+    those media elements, in document order, and ignore non-figure webpage
+    imagery.  There are deliberately no file-count, size, or filename
+    heuristics here.
+    """
     raw = html_path.read_text(encoding="utf-8", errors="replace")
-    parser = PaperHTMLTextParser(require_article=True)
+    media: list[tuple[str, str, str | None]] = []
+    source_to_name: dict[str, str] = {}
+
+    def resolve_media(
+        relative_url: str, alt: str | None, mime_type: str | None
+    ) -> str | None:
+        absolute_url = urllib.parse.urljoin(source, relative_url)
+        if absolute_url in source_to_name:
+            name = source_to_name[absolute_url]
+        else:
+            suffix = media_suffix(absolute_url, mime_type)
+            if suffix is None:
+                return None
+            name = f"asset_{len(media) + 1}{suffix}"
+            source_to_name[absolute_url] = name
+            media.append((absolute_url, name, mime_type))
+        label = (alt or "").strip()
+        return f"![{label}](assets/{name})"
+
+    resolver = resolve_media if asset_destination is not None else None
+    parser = PaperHTMLTextParser(require_article=True, media_resolver=resolver)
     parser.feed(raw)
     text = "".join(parser.parts)
     if len(text.strip()) < 1000:
-        parser = PaperHTMLTextParser(require_article=False)
+        media.clear()
+        source_to_name.clear()
+        parser = PaperHTMLTextParser(require_article=False, media_resolver=resolver)
         parser.feed(raw)
         text = "".join(parser.parts)
     text = unicodedata.normalize("NFKC", text)
@@ -307,20 +494,66 @@ def html_to_markdown(html_path: Path, markdown_path: Path, source: str) -> str:
     text = re.sub(r"\n{3,}", "\n\n", text).strip()
     if len(text) < 1000:
         raise RuntimeError("HTML text extraction produced implausibly little text")
+
+    assets: list[dict[str, str]] = []
+    selected: list[str] = []
+    if asset_destination is not None:
+        if asset_workers < 1:
+            raise ValueError("asset_workers must be at least 1")
+        asset_destination.parent.mkdir(parents=True, exist_ok=True)
+        with tempfile.TemporaryDirectory(
+            prefix="paper-assets-", dir=asset_destination.parent
+        ) as temporary:
+            temporary_dir = Path(temporary)
+
+            def download_media(
+                item: tuple[str, str, str | None],
+            ) -> tuple[str, str, str]:
+                absolute_url, name, _mime_type = item
+                target = temporary_dir / name
+                fetch(absolute_url, target)
+                return absolute_url, name, sha256(target)
+
+            with concurrent.futures.ThreadPoolExecutor(
+                max_workers=min(asset_workers, len(media)) if media else 1
+            ) as executor:
+                downloaded = list(executor.map(download_media, media))
+
+            for absolute_url, name, digest in downloaded:
+                selected.append(name)
+                assets.append(
+                    {
+                        "source": absolute_url,
+                        "local_path": f"assets/{name}",
+                        "sha256": digest,
+                    }
+                )
+            if asset_destination.exists():
+                shutil.rmtree(asset_destination)
+            shutil.copytree(temporary_dir, asset_destination)
     write_text(
         markdown_path,
-        "<!-- Generated from a public paper HTML rendering because PDF text "
-        f"extraction was unavailable. Authoritative source: paper.pdf; HTML: {source} -->\n\n"
+        "<!-- Generated from a public paper HTML rendering to preserve searchable "
+        f"text and logical figures. Authoritative source: paper.pdf; HTML: {source} -->\n\n"
         + text
         + "\n",
     )
-    return "paper-html"
+    conversion = "paper-html-with-figures" if asset_destination is not None else "paper-html"
+    return conversion, assets, selected
 
 
 def inferred_html_url(entry: dict[str, Any]) -> str | None:
+    arxiv_id = inferred_arxiv_id(entry)
+    return f"https://ar5iv.labs.arxiv.org/html/{arxiv_id}" if arxiv_id else None
+
+
+def inferred_arxiv_id(entry: dict[str, Any]) -> str | None:
     explicit = source_value(entry, ("html_url",))
     if explicit:
-        return explicit
+        parsed = urllib.parse.urlparse(explicit)
+        match = re.match(r"/html/([^/?#]+)", parsed.path)
+        if match:
+            return re.sub(r"\.pdf$", "", match.group(1))
     for key in ("paper_url", "pdf_url"):
         value = source_value(entry, (key,))
         if not value:
@@ -330,24 +563,170 @@ def inferred_html_url(entry: dict[str, Any]) -> str | None:
             continue
         match = re.match(r"/(?:abs|pdf)/([^/?#]+)", parsed.path)
         if match:
-            arxiv_id = re.sub(r"\.pdf$", "", match.group(1))
-            return f"https://ar5iv.labs.arxiv.org/html/{arxiv_id}"
+            return re.sub(r"\.pdf$", "", match.group(1))
     return None
+
+
+def clean_latex_caption(value: str) -> str:
+    value = re.sub(r"%[^\n]*", " ", value)
+    value = re.sub(r"\\(?:label|ref|cite)\*?(?:\[[^\]]*\])?\{[^}]*\}", " ", value)
+    value = re.sub(r"\\[a-zA-Z@]+\*?(?:\[[^\]]*\])?", " ", value)
+    value = value.replace("{", "").replace("}", "")
+    return re.sub(r"\s+", " ", value).strip()
+
+
+def arxiv_source_figure_assets(
+    entry: dict[str, Any], asset_destination: Path
+) -> tuple[list[dict[str, str]], list[str], str]:
+    """Materialize graphics explicitly referenced by LaTeX figure environments."""
+    arxiv_id = inferred_arxiv_id(entry)
+    if not arxiv_id:
+        raise RuntimeError("paper is not an identifiable arXiv entry")
+    source_url = f"https://export.arxiv.org/e-print/{arxiv_id}"
+    with tempfile.NamedTemporaryFile(suffix=".tar", delete=False) as handle:
+        archive_path = Path(handle.name)
+    try:
+        fetch(source_url, archive_path)
+        try:
+            archive = tarfile.open(archive_path, mode="r:*")
+        except tarfile.TarError as exc:
+            raise RuntimeError(f"arXiv source is not a readable archive: {exc}") from exc
+        with archive:
+            members: dict[str, bytes] = {}
+            for member in archive.getmembers():
+                if not member.isfile():
+                    continue
+                path = PurePosixPath(member.name.lstrip("./"))
+                if path.is_absolute() or any(part in {"", ".", ".."} for part in path.parts):
+                    continue
+                extracted = archive.extractfile(member)
+                if extracted is not None:
+                    members[path.as_posix()] = extracted.read()
+    finally:
+        archive_path.unlink(missing_ok=True)
+
+    tex_sources = [
+        (PurePosixPath(name), data.decode("utf-8", errors="replace"))
+        for name, data in members.items()
+        if name.lower().endswith(".tex")
+    ]
+    if not tex_sources:
+        raise RuntimeError("arXiv source archive contains no TeX files")
+
+    referenced: list[tuple[str, str]] = []
+    for tex_path, tex in tex_sources:
+        for figure_match in LATEX_FIGURE_RE.finditer(tex):
+            body = figure_match.group("body")
+            caption_match = LATEX_CAPTION_RE.search(body)
+            caption = clean_latex_caption(
+                caption_match.group("caption") if caption_match else ""
+            )
+            for graphic_match in LATEX_INCLUDEGRAPHICS_RE.finditer(body):
+                raw_reference = graphic_match.group("path").strip()
+                reference = PurePosixPath(raw_reference)
+                suffixes = ("",) if reference.suffix else LATEX_GRAPHIC_SUFFIXES
+                candidates: list[str] = []
+                for suffix in suffixes:
+                    candidate = (tex_path.parent / f"{reference.as_posix()}{suffix}").as_posix()
+                    if candidate in members:
+                        candidates.append(candidate)
+                    root_candidate = f"{reference.as_posix()}{suffix}"
+                    if root_candidate in members:
+                        candidates.append(root_candidate)
+                if not candidates:
+                    endings = tuple(f"/{reference.as_posix()}{suffix}" for suffix in suffixes)
+                    candidates = [
+                        name
+                        for name in members
+                        if name == reference.as_posix() or name.endswith(endings)
+                    ]
+                if candidates:
+                    referenced.append((candidates[0], caption))
+
+    referenced_by_source: dict[str, str] = {}
+    for source_name, caption in referenced:
+        referenced_by_source.setdefault(source_name, caption)
+    referenced = list(referenced_by_source.items())
+    if not referenced:
+        raise RuntimeError("arXiv TeX contains no resolvable figure graphics")
+
+    assets: list[dict[str, str]] = []
+    selected: list[str] = []
+    markdown_figures: list[str] = []
+    with tempfile.TemporaryDirectory(
+        prefix="paper-assets-", dir=asset_destination.parent
+    ) as temporary:
+        temporary_dir = Path(temporary)
+        for source_name, caption in referenced:
+            source_suffix = PurePosixPath(source_name).suffix.lower()
+            output_suffix = (
+                source_suffix if source_suffix in IMAGE_SUFFIXES else ".png"
+            )
+            name = f"asset_{len(selected) + 1}{output_suffix}"
+            target = temporary_dir / name
+            data = members[source_name]
+            if source_suffix in IMAGE_SUFFIXES:
+                target.write_bytes(data)
+            elif source_suffix in {".pdf", ".eps", ".ps"}:
+                try:
+                    import pymupdf
+
+                    document = pymupdf.open(stream=data, filetype=source_suffix.lstrip("."))
+                    try:
+                        if document.page_count < 1:
+                            raise RuntimeError(f"empty figure document: {source_name}")
+                        document[0].get_pixmap(dpi=144, alpha=False).save(target)
+                    finally:
+                        document.close()
+                except (ImportError, RuntimeError, ValueError, OSError) as exc:
+                    raise RuntimeError(
+                        f"cannot render arXiv figure {source_name}: {exc}"
+                    ) from exc
+            else:
+                continue
+            selected.append(name)
+            assets.append(
+                {
+                    "source": f"{source_url}#{source_name}",
+                    "local_path": f"assets/{name}",
+                    "sha256": sha256(target),
+                }
+            )
+            markdown_figures.append(f"![{caption}](assets/{name})")
+        if asset_destination.exists():
+            shutil.rmtree(asset_destination)
+        shutil.copytree(temporary_dir, asset_destination)
+    return assets, selected, "\n\n".join(markdown_figures)
 
 
 def copy_assets(entry: dict[str, Any], source_root: Path, destination: Path) -> list[dict[str, str]]:
     destination.mkdir(parents=True, exist_ok=True)
+    selected = normalize_asset_files(entry)
+    selected_set = set(selected)
+    # ``destination`` is generated task data. Reconcile it exactly so a
+    # previous broad scrape cannot leak stale files into a rebuilt package.
+    for existing in sorted(destination.rglob("*"), reverse=True):
+        if existing.is_file() and existing.relative_to(destination).as_posix() not in selected_set:
+            existing.unlink()
+        elif existing.is_dir():
+            try:
+                existing.rmdir()
+            except OSError:
+                pass
+    if not selected:
+        return []
     value = source_value(entry, ("assets_path", "paper_assets"))
     if not value:
-        return []
+        raise ValueError("non-empty asset_files requires assets_path or paper_assets")
     source = resolve_path(value, source_root)
     if not source.is_dir():
         raise FileNotFoundError(f"assets directory does not exist: {source}")
     records: list[dict[str, str]] = []
-    for item in sorted(source.rglob("*")):
+    for relative_name in selected:
+        relative = Path(*PurePosixPath(relative_name).parts)
+        item = source / relative
         if not item.is_file():
-            continue
-        relative = item.relative_to(source)
+            raise FileNotFoundError(f"selected PaperBench asset does not exist: {item}")
         target = destination / relative
         target.parent.mkdir(parents=True, exist_ok=True)
         if item.resolve() != target.resolve():
@@ -366,6 +745,8 @@ def blacklist_lines(entry: dict[str, Any]) -> list[str]:
     raw = entry.get("blacklist")
     if raw is None:
         raw = entry.get("official_repo", [])
+    if raw is None:
+        raw = []
     if isinstance(raw, str):
         raw = [raw]
     lines = [str(value).strip() for value in raw if str(value).strip()]
@@ -391,6 +772,7 @@ def normalized_metadata(entry: dict[str, Any]) -> dict[str, Any]:
         "paper_md",
         "assets_path",
         "paper_assets",
+        "asset_files",
         "blacklist",
     }
     return {key: value for key, value in entry.items() if key not in ignored}
@@ -403,6 +785,7 @@ def build_one(
     source_root: Path,
     offline: bool,
     force: bool,
+    asset_workers: int = 4,
 ) -> None:
     paper_id = entry["id"]
     paper_dir = output_root / "paper_sources" / paper_id
@@ -418,6 +801,8 @@ def build_one(
         and (paper_dir / "assets").is_dir()
         and all(path.is_file() for path in authoring_files)
     ):
+        (design_dir / "task_build_failure.json").unlink(missing_ok=True)
+        normalize_paper_package_permissions(paper_dir)
         print(f"skip {paper_id}: package already exists (use --force to rebuild)")
         return
     paper_dir.mkdir(parents=True, exist_ok=True)
@@ -437,6 +822,18 @@ def build_one(
     markdown_path = paper_dir / "paper.md"
     markdown_local = source_value(entry, ("markdown_path", "paper_md"))
     markdown_url = source_value(entry, ("markdown_url", "md_url"))
+    explicit_asset_selection = "asset_files" in entry
+    assets_source = source_value(entry, ("assets_path", "paper_assets"))
+    auto_figure_assets = (
+        not offline
+        and not markdown_local
+        and not markdown_url
+        and not explicit_asset_selection
+        and not assets_source
+        and inferred_html_url(entry) is not None
+    )
+    generated_assets: list[dict[str, str]] | None = None
+    generated_asset_files: list[str] | None = None
     if markdown_local or markdown_url:
         markdown_source = materialize_source(
             local_value=markdown_local,
@@ -446,6 +843,50 @@ def build_one(
             offline=offline,
         )
         markdown_conversion = "provided-markdown"
+    elif auto_figure_assets:
+        html_url = inferred_html_url(entry)
+        assert html_url is not None
+        with tempfile.NamedTemporaryFile(suffix=".html", delete=False) as handle:
+            html_path = Path(handle.name)
+        try:
+            fetch(html_url, html_path)
+            (
+                markdown_conversion,
+                generated_assets,
+                generated_asset_files,
+            ) = html_to_markdown(
+                html_path,
+                markdown_path,
+                html_url,
+                asset_destination=paper_dir / "assets",
+                asset_workers=asset_workers,
+            )
+            markdown_source = html_url
+        except RuntimeError as html_error:
+            try:
+                markdown_conversion = pdf_to_markdown(
+                    pdf_path, markdown_path, pdf_source
+                )
+                markdown_source = pdf_source
+                try:
+                    (
+                        generated_assets,
+                        generated_asset_files,
+                        figure_markdown,
+                    ) = arxiv_source_figure_assets(entry, paper_dir / "assets")
+                    with markdown_path.open("a", encoding="utf-8") as handle:
+                        handle.write("\n\n## Paper figures\n\n" + figure_markdown + "\n")
+                    markdown_conversion += "+arxiv-source-figures"
+                except RuntimeError as source_error:
+                    print(
+                        f"warning {paper_id}: semantic figure extraction unavailable; "
+                        f"HTML: {html_error}; arXiv source: {source_error}"
+                    )
+            except RuntimeError as pdf_error:
+                raise RuntimeError(
+                    f"paper HTML and PDF conversion both failed; HTML: {html_error}; "
+                    f"PDF: {pdf_error}"
+                ) from pdf_error
     else:
         markdown_source = pdf_source
         try:
@@ -458,7 +899,7 @@ def build_one(
                 html_path = Path(handle.name)
             try:
                 fetch(html_url, html_path)
-                markdown_conversion = html_to_markdown(
+                markdown_conversion, _assets, _selected = html_to_markdown(
                     html_path, markdown_path, html_url
                 )
                 markdown_source = html_url
@@ -468,7 +909,16 @@ def build_one(
     if len(markdown_path.read_text(encoding="utf-8", errors="replace")) < 1000:
         raise ValueError(f"{paper_id}: paper.md is implausibly short")
 
-    assets = copy_assets(entry, source_root, paper_dir / "assets")
+    if generated_assets is not None and generated_asset_files is not None:
+        selected_assets = generated_asset_files
+        omitted_asset_references: list[str] = []
+        assets = generated_assets
+        asset_policy = "paper-markdown-referenced-assets-v1"
+    else:
+        selected_assets = normalize_asset_files(entry)
+        omitted_asset_references = apply_asset_selection(markdown_path, selected_assets)
+        assets = copy_assets(entry, source_root, paper_dir / "assets")
+        asset_policy = "explicit-necessary-assets-v1"
     write_text(
         paper_dir / "config.yaml",
         f"id: {paper_id}\ntitle: {json.dumps(entry['title'], ensure_ascii=False)}\n",
@@ -479,7 +929,7 @@ def build_one(
     metadata = {
         **normalized_metadata(entry),
         "agent_visible": False,
-        "purpose": "Dataset-authoring metadata; never mount under /home/paper.",
+        "purpose": "Dataset-authoring metadata; never mount under /workspace/paper.",
         "authoring_status": "paper-package-built",
     }
     json_dump(design_dir / "task_metadata.json", metadata)
@@ -495,8 +945,15 @@ def build_one(
             "paper_md_conversion": markdown_conversion,
             "blacklist": lines,
             "assets": assets,
+            "asset_selection": {
+                "policy": asset_policy,
+                "selected": selected_assets,
+                "omitted_markdown_references": omitted_asset_references,
+            },
         },
     )
+    normalize_paper_package_permissions(paper_dir)
+    (design_dir / "task_build_failure.json").unlink(missing_ok=True)
     print(
         f"built {paper_id}: pages={page_count(pdf_path) or '?'} "
         f"markdown={markdown_path.stat().st_size} bytes assets={len(assets)}"
@@ -517,10 +974,21 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--offline", action="store_true")
     parser.add_argument("--force", action="store_true")
     parser.add_argument(
+        "--continue-on-error",
+        action="store_true",
+        help="record a failed paper package and continue building the remaining papers",
+    )
+    parser.add_argument(
         "--workers",
         type=int,
         default=4,
         help="number of paper packages to download and build concurrently",
+    )
+    parser.add_argument(
+        "--asset-workers",
+        type=int,
+        default=4,
+        help="number of semantic paper figure downloads per paper",
     )
     parser.add_argument(
         "--split-name",
@@ -534,6 +1002,8 @@ def main() -> None:
     args = parse_args()
     if args.workers < 1:
         raise ValueError("--workers must be at least 1")
+    if args.asset_workers < 1:
+        raise ValueError("--asset-workers must be at least 1")
     paper_list = args.paper_list.resolve()
     collection, entries = load_paper_list(paper_list)
     validate_entries(entries)
@@ -544,14 +1014,39 @@ def main() -> None:
     chosen = [entry for entry in entries if not selected or entry["id"] in selected]
     source_root = (args.source_root or paper_list.parent).resolve()
     output_root = args.output_root.resolve()
+    failures: dict[str, str] = {}
+
     def build(entry: dict[str, Any]) -> None:
-        build_one(
-            entry,
-            output_root=output_root,
-            source_root=source_root,
-            offline=args.offline,
-            force=args.force,
-        )
+        try:
+            build_one(
+                entry,
+                output_root=output_root,
+                source_root=source_root,
+                offline=args.offline,
+                force=args.force,
+                asset_workers=args.asset_workers,
+            )
+        except Exception as exc:
+            if not args.continue_on_error:
+                raise
+            paper_id = entry["id"]
+            reason = f"{type(exc).__name__}: {exc}"
+            failures[paper_id] = reason
+            json_dump(
+                output_root / "design" / paper_id / "task_build_failure.json",
+                {
+                    "paper_id": paper_id,
+                    "stage": "task-package-construction",
+                    "error_type": type(exc).__name__,
+                    "error": str(exc),
+                },
+            )
+            print(
+                f"{paper_id}: task package build failed; skipping this paper and "
+                f"continuing: {reason}",
+                file=sys.stderr,
+                flush=True,
+            )
 
     if args.workers == 1 or len(chosen) <= 1:
         for entry in chosen:
@@ -563,6 +1058,14 @@ def main() -> None:
             futures = [executor.submit(build, entry) for entry in chosen]
             for future in concurrent.futures.as_completed(futures):
                 future.result()
+
+    if failures:
+        print(
+            "task package construction completed with skipped papers: "
+            + ", ".join(failures),
+            file=sys.stderr,
+            flush=True,
+        )
 
     if not args.no_split:
         raw_name = args.split_name or str(collection.get("collection_id", paper_list.stem))

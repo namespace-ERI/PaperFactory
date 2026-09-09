@@ -2,7 +2,7 @@
 set -u
 
 TESTS_DIR="${HARBOR_TESTS_DIR:-/tests}"
-WORKSPACE_DIR="${HARBOR_WORKSPACE_DIR:-/home}"
+WORKSPACE_DIR="${HARBOR_WORKSPACE_DIR:-/workspace}"
 LOGS_DIR="${HARBOR_LOGS_DIR:-/logs/verifier}"
 CODE_ONLY="$(python -c 'import json,sys; print(1 if json.load(open(sys.argv[1], encoding="utf-8")).get("code_only") else 0)' "${TESTS_DIR}/judge_config.json")"
 REPRODUCTION_ENABLED="$([ "${CODE_ONLY}" = "1" ] && echo 0 || echo 1)"
@@ -10,10 +10,10 @@ REPRODUCTION_TIMEOUT_SEC="${PAPERBENCH_REPRODUCTION_TIMEOUT_SEC:-604800}"
 
 mkdir -p "${LOGS_DIR}"
 SUBMISSION_DIR="${WORKSPACE_DIR}/submission"
-PAPER_DIR="${WORKSPACE_DIR}/paper"
+PAPER_DIR="${HARBOR_PAPER_DIR:-${TESTS_DIR}/paper}"
 REPRO_DIR="${LOGS_DIR}/reproduction"
-CLEAN_SUBMISSION_DIR="${REPRO_DIR}/clean/home/submission"
-EXECUTED_SUBMISSION_DIR="${REPRO_DIR}/executed/home/submission"
+CLEAN_SUBMISSION_DIR="${REPRO_DIR}/clean/workspace/submission"
+EXECUTED_SUBMISSION_DIR="${REPRO_DIR}/executed/workspace/submission"
 rm -rf "${REPRO_DIR}"
 mkdir -p "${REPRO_DIR}"
 
@@ -126,10 +126,106 @@ payload["ready"] = payload["submission_valid"] and all(
 out.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
 PY
 
+AGENT_TRAJECTORY="${HARBOR_AGENT_TRAJECTORY_PATH:-/logs/agent/trajectory.json}"
+python - <<'PY' "${LOGS_DIR}/monitor.json" "${PAPER_DIR}/blacklist.txt" "${AGENT_TRAJECTORY}"
+import json, re, sys
+from pathlib import Path
+
+out = Path(sys.argv[1])
+blacklist_path = Path(sys.argv[2])
+trajectory_path = Path(sys.argv[3])
+
+blacklist = []
+if blacklist_path.is_file():
+    blacklist = [
+        line.strip()
+        for line in blacklist_path.read_text(encoding="utf-8", errors="replace").splitlines()
+        if line.strip() and not line.startswith("#")
+    ]
+if blacklist == ["none"]:
+    blacklist = []
+
+
+def normalize_url(value: str) -> str:
+    value = re.sub(r"^https?://", "", value)
+    value = re.sub(r"[?#].*$", "", value)
+    return value.strip()
+
+
+def strings(value):
+    if isinstance(value, str):
+        yield value
+    elif isinstance(value, dict):
+        for child in value.values():
+            yield from strings(child)
+    elif isinstance(value, list):
+        for child in value:
+            yield from strings(child)
+
+
+violations = []
+trajectory_error = ""
+trajectory = None
+if trajectory_path.is_file():
+    try:
+        trajectory = json.loads(trajectory_path.read_text(encoding="utf-8"))
+    except Exception as exc:
+        trajectory_error = f"{type(exc).__name__}: {exc}"
+
+seen = set()
+if isinstance(trajectory, dict) and blacklist:
+    stack = [trajectory]
+    while stack:
+        value = stack.pop()
+        if isinstance(value, dict):
+            calls = value.get("tool_calls")
+            if isinstance(calls, list):
+                for call in calls:
+                    if not isinstance(call, dict):
+                        continue
+                    command_text = "\n".join(strings(call.get("arguments")))
+                    if not any(command in command_text for command in ("git clone", "curl", "wget")):
+                        continue
+                    for blocked in blacklist:
+                        if normalize_url(blocked) not in command_text:
+                            continue
+                        key = (
+                            str(value.get("step_id") or ""),
+                            str(call.get("tool_call_id") or ""),
+                            blocked,
+                        )
+                        if key in seen:
+                            continue
+                        seen.add(key)
+                        violations.append(
+                            {
+                                "step_id": value.get("step_id"),
+                                "tool_call_id": call.get("tool_call_id"),
+                                "function_name": call.get("function_name"),
+                                "violation": blocked,
+                            }
+                        )
+            stack.extend(value.values())
+        elif isinstance(value, list):
+            stack.extend(value)
+
+payload = {
+    "monitor": "PaperBench BasicMonitor adapted to Harbor ATIF tool calls",
+    "trajectory_path": str(trajectory_path),
+    "trajectory_available": trajectory_path.is_file(),
+    "trajectory_parse_error": trajectory_error,
+    "blacklist_entries": len(blacklist),
+    "violations": violations,
+    "flagged": bool(violations),
+}
+out.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+PY
+
 SUBMISSION_VALID="$(python -c 'import json,sys; print(1 if json.load(open(sys.argv[1], encoding="utf-8")).get("submission_valid") else 0)' "${LOGS_DIR}/preflight.json")"
+MONITOR_FLAGGED="$(python -c 'import json,sys; print(1 if json.load(open(sys.argv[1], encoding="utf-8")).get("flagged") else 0)' "${LOGS_DIR}/monitor.json")"
 REPRO_RAN=0
 REPRO_SUCCESS=0
-if [ "${SUBMISSION_VALID}" = "1" ]; then
+if [ "${SUBMISSION_VALID}" = "1" ] && [ "${MONITOR_FLAGGED}" = "0" ]; then
   mkdir -p "${CLEAN_SUBMISSION_DIR}"
   cp -a "${SUBMISSION_DIR}/." "${CLEAN_SUBMISSION_DIR}/"
   git -C "${CLEAN_SUBMISSION_DIR}" clean -fd \
@@ -162,15 +258,22 @@ PY
   fi
 fi
 
-if [ "${SUBMISSION_VALID}" = "1" ]; then
+if [ "${MONITOR_FLAGGED}" = "1" ]; then
+  echo "monitor_disqualified" > "${REPRO_DIR}/exit_code.txt"
+elif [ "${SUBMISSION_VALID}" = "1" ]; then
   mkdir -p "${EXECUTED_SUBMISSION_DIR}"
   cp -a "${CLEAN_SUBMISSION_DIR}/." "${EXECUTED_SUBMISSION_DIR}/"
   if [ "${REPRODUCTION_ENABLED}" = "1" ] && [ -f "${EXECUTED_SUBMISSION_DIR}/reproduce.sh" ]; then
     REPRO_RAN=1
     chmod +x "${EXECUTED_SUBMISSION_DIR}/reproduce.sh" 2>/dev/null || true
+    date +%s > "${EXECUTED_SUBMISSION_DIR}/reproduce.log.creation_time"
     (
       cd "${EXECUTED_SUBMISSION_DIR}"
-      timeout "${REPRODUCTION_TIMEOUT_SEC}" bash ./reproduce.sh \
+      # Match official PaperBench reproduction: copied virtual environments
+      # are discarded and the interleaved stdout/stderr stream is persisted.
+      rm -rf venv .venv
+      timeout "${REPRODUCTION_TIMEOUT_SEC}" bash -o pipefail -c \
+        'bash ./reproduce.sh 2>&1 | tee reproduce.log' \
         > "${REPRO_DIR}/stdout.txt" 2> "${REPRO_DIR}/stderr.txt"
     )
     REPRO_RC=$?
@@ -219,6 +322,7 @@ python "${TESTS_DIR}/llm_rubric_judge.py" \
   --judge-config "${TESTS_DIR}/judge_config.json" \
   --reproduction-dir "${REPRO_DIR}" \
   --submission-validation "${LOGS_DIR}/preflight.json" \
+  --monitor-result "${LOGS_DIR}/monitor.json" \
   --reproduction-ran "${REPRO_RAN}" \
   --reproduction-success "${REPRO_SUCCESS}" \
   --reward-json "${LOGS_DIR}/reward.json" \

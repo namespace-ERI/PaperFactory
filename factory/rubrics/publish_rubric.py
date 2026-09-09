@@ -93,12 +93,10 @@ def publish_one(args: argparse.Namespace, paper_id: str) -> None:
                 )
     if not isinstance(review, dict):
         blockers.append("quality_review.json must contain an object")
-    elif review.get("blocking_issues"):
-        blockers.append("quality_review.json still contains blocking_issues")
+    elif not isinstance(review.get("blocking_issues", []), list):
+        blockers.append("quality_review.json blocking_issues must contain an array")
     if not isinstance(unresolved, list):
         blockers.append("unresolved_questions.json must contain an array")
-    elif unresolved:
-        blockers.append("unresolved_questions.json is not empty")
     if not isinstance(weight_application, dict) or not weight_application.get("valid"):
         blockers.append("rubric weight plan was not completely and validly applied")
     if blockers:
@@ -106,7 +104,12 @@ def publish_one(args: argparse.Namespace, paper_id: str) -> None:
             f"{paper_id}: refusing publication:\n- " + "\n- ".join(blockers)
         )
 
-    targets = [paper_dir / "rubric.json", paper_dir / "addendum.md"]
+    published_judge_addendum = paper_dir / "judge.addendum.md"
+    targets = [
+        paper_dir / "rubric.json",
+        paper_dir / "addendum.md",
+        published_judge_addendum,
+    ]
     existing = [path for path in targets if path.exists()]
     if existing and not args.replace:
         raise FileExistsError(
@@ -118,7 +121,9 @@ def publish_one(args: argparse.Namespace, paper_id: str) -> None:
     shutil.copy2(rubric_path, paper_dir / "rubric.json")
     shutil.copy2(addendum_path, paper_dir / "addendum.md")
     if judge_addendum_path.is_file():
-        shutil.copy2(judge_addendum_path, paper_dir / "judge.addendum.md")
+        shutil.copy2(judge_addendum_path, published_judge_addendum)
+    elif published_judge_addendum.exists():
+        published_judge_addendum.unlink()
     approval = {
         "paper_id": paper_id,
         "rubric_mode": rubric_mode,
@@ -131,8 +136,8 @@ def publish_one(args: argparse.Namespace, paper_id: str) -> None:
         "rubric_sha256": sha256(paper_dir / "rubric.json"),
         "addendum_sha256": sha256(paper_dir / "addendum.md"),
         "judge_addendum_sha256": (
-            sha256(paper_dir / "judge.addendum.md")
-            if judge_addendum_path.is_file()
+            sha256(published_judge_addendum)
+            if published_judge_addendum.is_file()
             else None
         ),
         "rubric_stats": rubric_report["stats"],

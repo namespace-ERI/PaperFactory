@@ -85,8 +85,9 @@ flowchart TD
 
 - `regular`：允许官方三类叶节点，即 `Code Development`、`Code Execution`、
   `Result Analysis`。
-- `code-dev`：完整树配权后，确定性保留 `Code Development` 叶节点及其祖先；不要求代码
-  真实执行，不要求 `reproduce.sh`、运行日志、生成指标或复现结果。
+- `code-dev`：完整树配权后，确定性保留 `Code Development` 叶节点及其祖先。生成的 Harbor
+  任务使用官方 Code-Dev instruction，明确评分时不执行代码；评测阶段不执行
+  `reproduce.sh`，也不使用运行日志、生成指标或复现结果作为评分证据。
 
 剪枝完全复刻官方 `reduce_to_category`：删除 Execution/Result 叶节点，删除没有保留后代的
 内部节点，保留其余节点的 ID、requirements 和原局部权重；不会针对 code-dev 再做一次
@@ -206,7 +207,10 @@ node ID，只允许局部整数权重 `1/2/3`，根节点固定为 `1`。
 - 深层树是否稀释重要叶节点；
 - 是否需要不公开给 agent 的 judge addendum。
 
-`blocking_issues` 不为空时，初稿不能正式发布。
+该审查是人工复核的审计材料，不属于官方 PaperBench 的确定性树校验或评分算法。
+Factory 不会因为 reviewer 的主观 `blocking_issues` 自动执行“语义修复、重新配权、再次
+审查”的循环，也不会仅因此拒绝 Harbor 导出。所有 findings 和 unresolved questions 仍会
+原样保留；确定性结构、局部权重、addendum 格式和 Code-Dev 剪枝不合法时仍会失败。
 
 ### 2.10 汇总与 provenance
 

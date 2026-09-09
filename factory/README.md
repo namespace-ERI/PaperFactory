@@ -108,7 +108,12 @@ paper list 可以是 JSON 数组，也可以是带 `papers` 数组的对象。�
 - Markdown 可由 `markdown_path`、`paper_md`、`markdown_url` 或 `md_url` 提供。
 - 没有 Markdown 时，Factory 依次尝试 `pdftotext`、`PyMuPDF`、`pypdf`，必要时
   再使用可推导出的 HTML 页面生成可搜索文本。
-- 没有 assets 时会创建合法的空 `assets/`，所以 URL-only 列表可以运行。
+- 官方 PaperBench 的 `paper.md` 通过 `assets/asset_N.*` 引用论文图。对于 arXiv URL-only
+  输入，Factory 从论文 HTML 正文的语义 `<figure>` 中提取 `img`/image `object`，按文档
+  顺序同步生成 assets 和 Markdown 引用；不会抓取网页 logo、导航图片等非 figure 内容。
+- 不设置图片数量/尺寸阈值，也不通过文件名猜测重要性。若已有人工整理资源，可用
+  `assets_path`/`paper_assets` 加 `asset_files` 显式覆盖自动路径；没有可用 figure 的论文
+  才会保留空 `assets/`。
 - `--offline` 只能使用本地文件，不能和仅有 URL 的输入搭配。
 - `official_repo` 只用于生成 `blacklist.txt`；Factory 不 clone、不下载、不读取
   作者官方仓库。
@@ -123,14 +128,51 @@ cd /root/workspace/Task/PaperBench
 python3 -m pip install -r factory/requirements.txt
 export OPENAI_API_KEY=...
 
+# 200+ 篇推荐使用可断点续跑的 paperlist 批处理入口
+python3 factory/run_paperlist_batch.py \
+  --paper-list /path/to/new-paperlist.json \
+  --model gpt-5.5-high \
+  --base-url http://your-openai-compatible-endpoint/v1 \
+  --rubric-mode code-dev \
+  --task-workers 1 \
+  --asset-workers 4 \
+  --paper-workers 1 \
+  --workers 2
+```
+
+`run_paperlist_batch.py` 会读取并校验整个 paperlist，打印论文数量、批次 ID、12 小时
+agent timeout 和模型请求并发上限，然后复用唯一的完整管线入口。Task 素材阶段按
+`--task-workers` 并发，rubric 阶段按 `--paper-workers` 并发：已有完整 Task 包会跳过，完整
+rubric 会跳过，中断的不完整 rubric 会重新开始；每道 rubric 完成并通过同一套转换校验后，
+由单一协调器把对应 task 原子写入日期批次并更新 `manifest.jsonl`。全部论文完成后，标准全量转换会重新校验并
+原子替换为完整批次。URL-only 论文的语义 figure 选择规则保持不变，只是单篇内部默认最多
+同时下载 4 个已选 figure。大批量入口会隔离单篇失败：task 素材构造失败时保留
+`task_build_failure.json`，rubric 制作失败时保留 `authoring_failure.json`；该论文不会进入
+下一阶段，后续论文继续生成。最终批次及 `manifest.jsonl` 只包含通过现有 task 完整性、
+rubric 确定性结构、权重和 addendum 校验的论文。可用 `--no-incremental-harbor`
+关闭逐题输出。正式执行前可增加 `--dry-run` 检查展开后的命令，不会访问模型或写生成数据。
+
+独立 LLM 语义审查只运行一次并完整写入 `quality_review.json` 和
+`unresolved_questions.json`，作为人工复核的审计材料。它不属于官方 PaperBench 的确定性
+评分或树校验，因此 reviewer 的主观 blocking issue 不会自动重写 rubric，也不会单独阻止
+Harbor 导出。结构错误仍由 `--repair-rounds` 控制有限修复；结构、局部权重、addendum 或
+Code-Dev 确定性剪枝不合法时仍会拒绝导出。
+
+单次或需要完整控制所有参数时也可以直接使用底层入口：
+
+```bash
+export OPENAI_API_KEY=...
+
 python3 factory/build_paperbench.py \
   --paper-list factory/paperlist/20260815.json \
   --model gpt-5.5-high \
   --base-url http://your-openai-compatible-endpoint/v1 \
   --rubric-mode regular \
-  --task-workers 4 \
-  --paper-workers 4 \
+  --task-workers 1 \
+  --asset-workers 4 \
+  --paper-workers 1 \
   --workers 2 \
+  --stream-papers \
   --batch-id 20260817-120000
 ```
 
@@ -285,8 +327,8 @@ flowchart TD
   `Result Analysis` 叶节点，执行 `reproduce.sh` 后综合代码、日志和结果评分。
 - `code-dev`：先构造与配权完整三类树，再删除非 `Code Development` 叶节点和因此变空的
   祖先；保留节点 ID、祖先结构和原局部权重，不为 code-dev 另行配权。评分时剩余兄弟按
-  官方递归公式自然重新归一化。Harbor 使用官方 code-only instruction，不要求
-  `reproduce.sh`，也不检查运行结果或论文趋势。
+  官方递归公式自然重新归一化。Harbor 使用官方 Code-Dev instruction，明确评分时不执行
+  代码；评测阶段不执行 `reproduce.sh`，且不按运行结果或论文趋势打分。
 
 模式会写入 `authoring_provenance.json`、`judge_config.json` 和 `task.toml`。已有完整草稿
 不能用 `--resume-rubric` 切换模式；需要显式 `--overwrite-rubric` 重新生成。
@@ -351,7 +393,9 @@ python3 factory/rubrics/create_rubrics.py \
 
 `--resume` 会跳过拥有完整 authoring 产物的论文；对中断留下的不完整 authoring
 目录，它会删除该不完整目录并从该论文开头重新生成。`--overwrite` 会显式重建已有
-完整草稿，两者不能同时使用。
+完整草稿，两者不能同时使用。直接调用本脚本时默认仍为严格模式；增加
+`--continue-on-error` 后，单篇失败会被记录并跳过，剩余论文继续执行。批量入口
+`run_paperlist_batch.py` 默认启用这一行为。
 
 ## 7. 人工审核与发布门槛
 
@@ -360,7 +404,7 @@ python3 factory/rubrics/create_rubrics.py \
 1. 逐项核对 contribution-evidence matrix 的论文来源和核心贡献覆盖；
 2. 用 gold run 确定范围、资源、指标、容差和缩小实验是否现实；
 3. 处理 `quality_review.json` 的全部 `blocking_issues`；
-4. 处理并清空 `unresolved_questions.json`；
+4. 处理 `unresolved_questions.json` 中显式标记 `blocking: true` 的问题，并复核非阻塞提醒；
 5. 检查叶节点是否原子、是否可从代码/执行/结果证据观察、是否重复计分；
 6. 检查全局有效权重，避免树深或叶子数量意外稀释核心贡献；
 7. 使用完整实现、只写代码未运行、明显缺陷三类提交校准，并由至少两位评分者复核。
@@ -413,23 +457,32 @@ judge addendum 写入 `paper_sources/<id>/`，并记录 `human_approval.json` �
 │   ├── llm_rubric_judge.py
 │   ├── judge_config.json
 │   ├── rubric.json
-│   └── judge.addendum.md
-└── solution/
-    ├── reproduce.sh
-    └── README.md
+│   ├── judge.addendum.md
+│   └── paper/                  # verifier-only immutable text/PDF copy，不重复 assets
 ```
 
-Factory 在仓库中固定保存官方 PaperBench instructions 原文，其 SHA-256 为：
+Factory 在仓库中固定保存官方 PaperBench full 与 Code-Dev instructions 原文，其 SHA-256 为：
 
 ```text
 712ed3968de5b8d98b96e25e7d33c95552c460649201743d8535e84c344bac56
+65a75977810a1bca53e69767740c07f5c71c6d632838ebd32ba22d69e2a49d9e
 ```
 
-输出 `instruction.md` 只把官方原文中的 `NVIDIA A10 GPU` 确定性替换为实际
-`NVIDIA H200 GPU`；其余文字保持不变，包括 `/home/paper`、`/home/submission` 和
-“最多运行 7 天”。Task、Artifact 和 verifier 也统一使用这套 `/home` 路径，默认
+输出 `instruction.md` 对对应模式的官方原文做确定性运行环境适配：把 full 原文的
+`NVIDIA A10 GPU` 替换为 `NVIDIA H200 GPU`，并把 `/home/paper`、`/home/submission`
+分别替换为 `/workspace/paper`、`/workspace/submission`；随后追加官方 BasicAgent 的动态
+notes，声明 H200、12 小时任务工作期限和 `/workspace/agent.env`。Full 模式保留七天
+`reproduce.sh` 口径；Code-Dev 使用官方 code-only instruction，不要求也不执行
+`reproduce.sh`。Task、Artifact 和 verifier 统一使用这套 `/workspace` 路径，默认
 reproduction timeout 为 604800 秒。`task.toml` 不写入 API key/base URL 占位符；
 verifier 运行时由 Harbor 安全注入 `JUDGE_LLM_API_KEY` 与 `JUDGE_LLM_BASE_URL`。
+Harbor 另将 `/logs/agent/trajectory.json` 显式传入 separate verifier，用 ATIF tool-call
+参数执行官方 blacklist monitor，并在违规时于 reproduction/judge 之前判零；verifier 使用
+隐藏 `tests/paper/` 保存 `paper.pdf`、`paper.md`、`addendum.md` 和 `blacklist.txt` 的不可变
+同哈希快照，不信任 agent 可写的 `/workspace/paper`。只有 paperlist `asset_files` 显式选中的
+必要资源会进入 `environment/paper/assets/`；ar5iv 等转换器自动抓取但未经 task author
+选择的图片不会进入成品。官方 judge 不读取图片，因此 `tests/paper/` 不重复复制 assets。
+这里没有自定义数量或尺寸上限，控制依据是官方的“necessary resources”人工选择语义。
 
 公共 processed Harbor 字段与当前 `native_rollout_task_v1` 参考格式对齐：metadata 同时写入
 `source_native_contract`、`construction_format`、`native_task_id`、
@@ -438,13 +491,18 @@ verifier 运行时由 Harbor 安全注入 `JUDGE_LLM_API_KEY` 与 `JUDGE_LLM_BAS
 `gpu_types = ["H200"]`，并由转换后的自动校验检查 TOML、resource metadata 与题面中的
 H200 资源声明一致。PaperBench 专属路径、联网方式和 LLM rubric judge 不会被 MLS 值覆盖。
 
-Judge 模板保存在 `factory/harbor/templates/`，不再依赖可能被热修的共享参考题。它不向
-gpt-5.5 上游发送 temperature，按 README/reproduce/结果/源码优先收集提交文件，并且
-超时后不会无条件重发同一个大请求。叶节点严格二元评分（0 或 1），总分按 rubric 树
-逐层使用兄弟节点局部权重递归聚合，不会把叶子权重误当成全局权重。Verifier 还会检查
-submission 是以自身为根且含 HEAD 的 Git 仓库、所有 tracked 修改已提交、README 和
-reproduce.sh 已提交、HEAD 中 committed files 总量不超过 1GB；随后对隔离副本执行
-`git clean -fd`，只把清理后的副本交给 judge。详细契约见
+Judge 模板保存在 `factory/harbor/templates/`，不再依赖可能被热修的共享参考题。评分语义
+移植官方 `SimpleJudge`：每个叶节点先按官方白名单和 file-ranking prompt 选择最多 10 个
+相关文件，再使用官方三段式 prompt 判分，并由官方二元解析 prompt 提取 0/1；没有
+results/metrics 关键词优先级或固定 200 文件/3500 字符/60000 字符截断。文件树、论文、
+运行日志和最多 10 个相关文件按官方上下文预算处理。总分按 rubric 树逐层使用兄弟节点局部
+权重递归聚合；对官方 source id 为 `pinn` 的大 rubric，与官方 `create_judge.py` 一样只
+保留最后 5 个 prior rubric nodes。Judge 请求不发送 temperature。Verifier 还会检查 submission 是以自身
+为根且含 HEAD 的 Git 仓库、所有 tracked 修改已提交、README（常规模式还包括
+reproduce.sh）已提交、HEAD 中 committed files 总量不超过 1GB；随后对隔离副本执行
+`git clean -fd`。Code-dev 只从 Git HEAD 枚举评分证据，忽略未提交和 `.gitignore` 文件；
+regular 则检查执行后的文件树。Judge 详情会分别记录请求模型名和兼容 API 响应自报的
+模型名，不再把 `PAPERBENCH_JUDGE_MODEL` 写成对路由后模型身份的证明。详细契约见
 [`factory/harbor/README.md`](harbor/README.md)。
 
 单独转换已有 task 和 rubric：
@@ -470,7 +528,9 @@ python3 factory/harbor/convert_to_harbor.py \
 | `--paper ID` | 全部 | 只选择指定论文；可重复 |
 | `--offline` | Task | 禁止联网，只使用本地输入 |
 | `--force-task` | Task | 重建已存在的 task 包 |
-| `--task-workers N` | Task | 同时下载、转换多少篇论文，默认 4 |
+| `--task-workers N` | Task | 同时下载、转换多少篇论文；默认 1 |
+| `--asset-workers N` | Task | 单篇内部并发下载多少个已选择的语义 figure；默认 4，不改变素材选择规则 |
+| `--stream-papers` | 全部 | 并行制作论文，由单一协调器串行导出，每题成功后立即落盘 |
 | `--rubric-mode MODE` | Rubric/Harbor | `regular`（默认）或只评代码实现的 `code-dev` |
 | `--paper-workers N` | Rubric | 同时制作多少篇 rubric，默认 1 |
 | `--workers N` | Rubric | 单篇内部的 chunk/子树并发，默认 3 |
@@ -481,9 +541,12 @@ python3 factory/harbor/convert_to_harbor.py \
 | `--second-model MODEL` | Rubric | 切换位置之后使用的第二模型 |
 | `--model-switch-after N` | Rubric | 前 N 篇用主模型，其余用第二模型 |
 | `--batch-id DATE` | Harbor | 设置最终日期批次目录名 |
+| `--harbor-agent-timeout-sec N` | Harbor | agent rollout 时限，默认 43200（12 小时），与七天 reproduction verifier 预算独立 |
+| `--harbor-verifier-timeout-sec N` | Harbor | 整个 verifier 时限，默认 609000（七天 reproduction、最多两轮各三次 600 秒 judge 阶段和 600 秒基础开销，覆盖默认最多 120 个叶节点）；旧 `--harbor-timeout-sec` 是兼容别名 |
 | `--harbor-reproduction-timeout-sec N` | Harbor | `reproduce.sh` verifier 时限，默认 604800（7 天） |
-| `--harbor-judge-request-timeout-sec N` | Harbor | 单个 leaf judge 请求时限，默认 600；超时不盲重试 |
+| `--harbor-judge-request-timeout-sec N` | Harbor | 单次上游 judge 请求时限，默认 600；官方每叶的文件排序、判分和解析分别调用 |
 | `--harbor-judge-max-workers N` | Harbor | leaf judge 最大并发数，默认 100；单 leaf 失败不影响其他 leaf |
+| `--harbor-judge-context-window-tokens N` | Harbor | judge 上下文窗口，默认 400000，需与实际部署模型一致 |
 | `--require-approved` | Harbor | 禁止未人工批准的 draft 进入批次 |
 | `--overwrite-harbor` | Harbor | 替换同名的未完成或旧批次 |
 
@@ -606,9 +669,11 @@ python3 factory/rubrics/validate_rubric.py --paper tent --packages
 
 - `manifest.jsonl` 行数等于 `harbor_task/` 子目录数；
 - 每个 manifest `paper_id` 都来自本次明确选择的论文；
-- 每题所需环境、tests 和 solution 文件齐全；
-- 每份 `instruction.md` 除 `A10 → H200` 外都与固定官方原文一致；
-- task、Artifact、instruction 和 verifier 路径统一为 `/home/paper`、`/home/submission`；
+- 每题所需 environment/tests 文件齐全；因为无 reference solution，不输出可选 `solution/`；
+- 每份 `instruction.md` 分别以官方 full/code-only 原文为基线，只包含官方动态 notes、
+  `A10 → H200`（full）和 `/home → /workspace` 运行环境适配；
+- instruction 与 agent 挂载统一为 `/workspace/paper`、`/workspace/submission`，submission
+  artifact 使用 `/workspace/submission`，verifier 从隐藏的 `/tests/paper` 读取同哈希 ground truth；
 - `task.toml` 不含 LLM/JUDGE secret 占位符，judge 只读取运行时注入的 `JUDGE_LLM_*`；
 - verifier 检查 Git/HEAD/已提交状态/1GB 上限并对评分副本执行 `git clean -fd`；
 - judge 只接受叶节点 0/1，并按树逐层递归聚合兄弟节点局部权重；

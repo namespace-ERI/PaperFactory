@@ -1,19 +1,27 @@
 from __future__ import annotations
 
 import importlib.util
+import io
 import json
 import os
 import shutil
 import subprocess
 import sys
+import tarfile
 import tempfile
+import threading
+import time
 import unittest
+from unittest.mock import patch
 from pathlib import Path
 
 
 FACTORY = Path(__file__).resolve().parents[1]
 FACTORY_SCRIPT = FACTORY / "build_paperbench.py"
+BATCH_SCRIPT = FACTORY / "run_paperlist_batch.py"
 TASK_SCRIPT = FACTORY / "task" / "build_tasks.py"
+RUBRIC_SCRIPT = FACTORY / "rubrics" / "create_rubrics.py"
+HARBOR_CONVERTER = FACTORY / "harbor" / "convert_to_harbor.py"
 PUBLISH_SCRIPT = FACTORY / "rubrics" / "publish_rubric.py"
 JUDGE_TEMPLATE = (
     FACTORY / "harbor" / "templates" / "processed_task" / "tests" / "llm_rubric_judge.py"
@@ -21,14 +29,57 @@ JUDGE_TEMPLATE = (
 VERIFIER_TEMPLATE = (
     FACTORY / "harbor" / "templates" / "processed_task" / "tests" / "test.sh"
 )
+OFFICIAL_JUDGE_CONSTANTS = (
+    FACTORY.parents[2]
+    / "Bench/PaperBench/source/project/paperbench/paperbench/judge/constants.py"
+)
 sys.path.insert(0, str(FACTORY / "rubrics"))
+sys.path.insert(0, str(FACTORY / "harbor"))
 
-from rubric_lib import paperbench_code_only_rubric, validate_rubric  # noqa: E402
+from rubric_lib import (  # noqa: E402
+    paperbench_code_only_rubric,
+    validate_rubric,
+)
+from export_incremental import completed_final_batch_task_count  # noqa: E402
+from convert_to_harbor import select_authored_bundle  # noqa: E402
 
 
 def dump(path: Path, value: object) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(value, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+
+
+def expected_harbor_instruction(rubric_mode: str = "regular") -> str:
+    filename = (
+        "instructions.code-dev.official.txt"
+        if rubric_mode == "code-dev"
+        else "instructions.official.txt"
+    )
+    official = (FACTORY / "harbor" / "templates" / filename).read_text(encoding="utf-8")
+    rendered = (
+        official.replace("/home/paper", "/workspace/paper")
+        .replace("/home/submission", "/workspace/submission")
+    )
+    if rubric_mode == "regular":
+        rendered = rendered.replace("NVIDIA A10 GPU", "NVIDIA H200 GPU")
+    runtime_note = (
+        "You are expected to work until you have spent 12 hours on this task. You may iteratively "
+        "develop your solution within these constraints, but bear in mind that program runtime also "
+        "counts towards the time limit. This is a difficult task and we expect a good solution to "
+        "require using the full time limit."
+    )
+    additional_notes = f"""
+
+ADDITIONAL NOTES
+------
+- **Compute**: You have access to a NVIDIA H200 GPU with the appropriate drivers installed.
+- **Total Runtime**: {runtime_note}
+- **API keys**: You have been granted API keys for services necessary for replicating your paper. The API keys are available to you at `/workspace/agent.env`. You can assume that these same API keys will already be set as environment variables in the reproduction environment when we evaluate your submission, so you do not need to set or export them in your submission.
+- You have root access in your environment.
+- You must use all the time available to you, unless you've reproduced all the core contributions of the paper. Do not stop until you've reproduced them.
+- Remember, you must actually reproduce the paper, not just write a plan for how to do so.
+"""
+    return rendered.rstrip() + "\n" + additional_notes
 
 
 def valid_tree() -> dict:
@@ -101,6 +152,336 @@ def valid_tree() -> dict:
     }
 
 
+class TaskAssetTests(unittest.TestCase):
+    @staticmethod
+    def load_task_module():
+        spec = importlib.util.spec_from_file_location("paperbench_task_builder", TASK_SCRIPT)
+        assert spec is not None and spec.loader is not None
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        return module
+
+    def test_null_official_repo_produces_empty_blacklist(self) -> None:
+        module = self.load_task_module()
+        self.assertEqual(module.blacklist_lines({"official_repo": None}), [])
+
+    def test_task_builder_skips_one_failed_paper_and_continues(self) -> None:
+        module = self.load_task_module()
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            paper_list = root / "paperlist.json"
+            dump(
+                paper_list,
+                {
+                    "papers": [
+                        {"id": paper_id, "title": paper_id, "pdf_url": "https://example.test/p.pdf"}
+                        for paper_id in ("paper-good-a", "paper-bad", "paper-good-b")
+                    ]
+                },
+            )
+            calls: list[str] = []
+
+            def fake_build_one(entry, **_kwargs) -> None:
+                calls.append(entry["id"])
+                if entry["id"] == "paper-bad":
+                    raise RuntimeError("download forbidden")
+
+            argv = [
+                str(TASK_SCRIPT),
+                "--paper-list",
+                str(paper_list),
+                "--output-root",
+                str(root),
+                "--workers",
+                "1",
+                "--continue-on-error",
+                "--no-split",
+            ]
+            with patch.object(module, "build_one", side_effect=fake_build_one), patch.object(
+                sys, "argv", argv
+            ):
+                module.main()
+
+            self.assertEqual(calls, ["paper-good-a", "paper-bad", "paper-good-b"])
+            failure = load_json(root / "design" / "paper-bad" / "task_build_failure.json")
+            self.assertEqual(failure["error_type"], "RuntimeError")
+            self.assertEqual(failure["error"], "download forbidden")
+
+    def test_html_conversion_materializes_only_semantic_figure_media(self) -> None:
+        module = self.load_task_module()
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            html = root / "paper.html"
+            markdown = root / "paper.md"
+            assets = root / "assets"
+            html.write_text(
+                "<html><body><article>"
+                "<h1>Paper</h1><p>" + "method evidence " * 100 + "</p>"
+                '<img src="site-logo.png" alt="site logo">'
+                '<figure><object type="image/svg+xml" data="figures/main.svg"></object>'
+                '<figcaption>Main result.</figcaption></figure>'
+                '<figure><figure><img src="figures/panel.png" alt="Panel A"></figure>'
+                '<figcaption>Panel result.</figcaption></figure>'
+                "</article></body></html>",
+                encoding="utf-8",
+            )
+
+            def fake_fetch(url: str, destination: Path, *, retries: int = 4) -> None:
+                del retries
+                destination.parent.mkdir(parents=True, exist_ok=True)
+                destination.write_bytes(url.encode())
+
+            with patch.object(module, "fetch", side_effect=fake_fetch):
+                conversion, records, selected = module.html_to_markdown(
+                    html,
+                    markdown,
+                    "https://paper.example/html/1234",
+                    asset_destination=assets,
+                )
+
+            self.assertEqual(conversion, "paper-html-with-figures")
+            self.assertEqual(selected, ["asset_1.svg", "asset_2.png"])
+            self.assertEqual(len(records), 2)
+            self.assertEqual(
+                {path.name for path in assets.iterdir()},
+                {"asset_1.svg", "asset_2.png"},
+            )
+            rendered = markdown.read_text(encoding="utf-8")
+            self.assertIn("![](assets/asset_1.svg)", rendered)
+            self.assertIn("![Panel A](assets/asset_2.png)", rendered)
+            self.assertNotIn("site-logo.png", rendered)
+
+    def test_html_asset_downloads_are_bounded_and_keep_document_order(self) -> None:
+        module = self.load_task_module()
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            html = root / "paper.html"
+            markdown = root / "paper.md"
+            assets = root / "assets"
+            figures = "".join(
+                f'<figure><img src="figures/{index}.png" alt="Figure {index}"></figure>'
+                for index in range(6)
+            )
+            html.write_text(
+                "<html><body><article><p>" + "paper evidence " * 100 + "</p>"
+                + figures
+                + "</article></body></html>",
+                encoding="utf-8",
+            )
+            lock = threading.Lock()
+            active = 0
+            max_active = 0
+
+            def fake_fetch(url: str, destination: Path, *, retries: int = 4) -> None:
+                nonlocal active, max_active
+                del retries
+                with lock:
+                    active += 1
+                    max_active = max(max_active, active)
+                time.sleep(0.03)
+                destination.write_bytes(url.encode())
+                with lock:
+                    active -= 1
+
+            with patch.object(module, "fetch", side_effect=fake_fetch):
+                _conversion, records, selected = module.html_to_markdown(
+                    html,
+                    markdown,
+                    "https://paper.example/html/1234",
+                    asset_destination=assets,
+                    asset_workers=2,
+                )
+
+            self.assertEqual(max_active, 2)
+            self.assertEqual(selected, [f"asset_{index}.png" for index in range(1, 7)])
+            self.assertEqual(
+                [row["local_path"] for row in records],
+                [f"assets/asset_{index}.png" for index in range(1, 7)],
+            )
+
+    def test_arxiv_source_fallback_uses_only_latex_figure_graphics(self) -> None:
+        module = self.load_task_module()
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            archive_path = root / "source.tar.gz"
+            tex = (
+                b"\\includegraphics{logo.png}\n"
+                b"\\begin{figure}\\includegraphics{main.png}"
+                b"\\caption{Main result}\\end{figure}\n"
+            )
+            with tarfile.open(archive_path, "w:gz") as archive:
+                for name, data in (("paper.tex", tex), ("logo.png", b"logo"), ("main.png", b"main")):
+                    info = tarfile.TarInfo(name)
+                    info.size = len(data)
+                    archive.addfile(info, io.BytesIO(data))
+
+            def fake_fetch(url: str, destination: Path, *, retries: int = 4) -> None:
+                del url, retries
+                shutil.copy2(archive_path, destination)
+
+            assets = root / "assets"
+            with patch.object(module, "fetch", side_effect=fake_fetch):
+                records, selected, markdown = module.arxiv_source_figure_assets(
+                    {"pdf_url": "https://arxiv.org/pdf/1234.5678"}, assets
+                )
+            self.assertEqual(selected, ["asset_1.png"])
+            self.assertEqual(len(records), 1)
+            self.assertEqual((assets / "asset_1.png").read_bytes(), b"main")
+            self.assertIn("![Main result](assets/asset_1.png)", markdown)
+
+
+class RubricModelClientTests(unittest.TestCase):
+    @staticmethod
+    def load_rubric_module():
+        spec = importlib.util.spec_from_file_location(
+            "paperbench_create_rubrics", RUBRIC_SCRIPT
+        )
+        assert spec is not None and spec.loader is not None
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        return module
+
+    def test_empty_and_non_json_upstream_responses_are_retried(self) -> None:
+        module = self.load_rubric_module()
+
+        class FakeResponse:
+            status = 200
+            headers = {"Content-Type": "application/json"}
+
+            def __init__(self, body: bytes) -> None:
+                self.body = body
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, exc_type, exc, traceback) -> None:
+                del exc_type, exc, traceback
+
+            def read(self) -> bytes:
+                return self.body
+
+        valid = json.dumps(
+            {
+                "choices": [
+                    {"message": {"content": json.dumps({"ok": True})}}
+                ]
+            }
+        ).encode("utf-8")
+        responses = iter((FakeResponse(b""), FakeResponse(b"not-json"), FakeResponse(valid)))
+        client = module.OpenAICompatibleClient(
+            model="fixture-model",
+            api_key="fixture-key",
+            base_url="http://model.invalid",
+            timeout=1,
+            max_completion_tokens=100,
+            retries=3,
+        )
+        with patch.object(
+            module.urllib.request, "urlopen", side_effect=lambda *args, **kwargs: next(responses)
+        ) as urlopen, patch.object(module.time, "sleep") as sleep:
+            result = client.complete(call_name="fixture", system="system", user="user")
+
+        self.assertEqual(result, {"ok": True})
+        self.assertEqual(urlopen.call_count, 3)
+        self.assertEqual(sleep.call_count, 2)
+
+    def test_continue_on_error_skips_failed_paper_and_runs_remaining(self) -> None:
+        module = self.load_rubric_module()
+        args = type(
+            "Args",
+            (),
+            {"paper_workers": 1, "continue_on_error": True},
+        )()
+        calls: list[str] = []
+
+        def fake_author_one(_args, paper_id: str, _guide: str) -> None:
+            calls.append(paper_id)
+            if paper_id == "paper-bad":
+                raise RuntimeError("quality gate failed")
+
+        with patch.object(module, "author_one", side_effect=fake_author_one):
+            failures = module.author_papers(
+                args,
+                ["paper-good-a", "paper-bad", "paper-good-b"],
+                "guide",
+            )
+
+        self.assertEqual(calls, ["paper-good-a", "paper-bad", "paper-good-b"])
+        self.assertEqual(
+            failures,
+            {"paper-bad": "RuntimeError: quality gate failed"},
+        )
+
+    def test_only_explicitly_blocking_unresolved_questions_block_export(self) -> None:
+        module = self.load_rubric_module()
+        review = {
+            "unresolved_questions": [
+                {"question": "missing grading fact", "blocking": True},
+                {"question": "gold-run follow-up", "blocking": False},
+                {"question": "legacy note without classification"},
+                "free-form warning",
+            ]
+        }
+
+        self.assertEqual(
+            module.blocking_unresolved_from(review),
+            [{"question": "missing grading fact", "blocking": True}],
+        )
+        self.assertEqual(len(module.unresolved_from(review)), 4)
+
+    def test_quality_review_receives_complete_paper_text(self) -> None:
+        module = self.load_rubric_module()
+
+        class CapturingClient:
+            def __init__(self) -> None:
+                self.user = ""
+
+            def complete(self, *, call_name: str, system: str, user: str):
+                del call_name, system
+                self.user = user
+                return {"blocking_issues": [], "unresolved_questions": []}
+
+        client = CapturingClient()
+        module.review_drafts(
+            client,
+            paper_id="fixture-paper",
+            paper_text="UNIQUE COMPLETE PAPER EVIDENCE",
+            matrix={},
+            addendum="No addendum.",
+            rubric=valid_tree(),
+            validation={"valid": True},
+            rubric_mode="regular",
+        )
+
+        self.assertIn("<paper id=\"fixture-paper\">", client.user)
+        self.assertIn("UNIQUE COMPLETE PAPER EVIDENCE", client.user)
+        self.assertIn("blocking=true only", client.user)
+
+    def test_rubric_authoring_remains_strict_without_continue_on_error(self) -> None:
+        module = self.load_rubric_module()
+        args = type(
+            "Args",
+            (),
+            {"paper_workers": 1, "continue_on_error": False},
+        )()
+        calls: list[str] = []
+
+        def fake_author_one(_args, paper_id: str, _guide: str) -> None:
+            calls.append(paper_id)
+            if paper_id == "paper-bad":
+                raise RuntimeError("quality gate failed")
+
+        with patch.object(module, "author_one", side_effect=fake_author_one):
+            with self.assertRaisesRegex(RuntimeError, "quality gate failed"):
+                module.author_papers(
+                    args,
+                    ["paper-good-a", "paper-bad", "paper-never-started"],
+                    "guide",
+                )
+
+        self.assertEqual(calls, ["paper-good-a", "paper-bad"])
+
+
 class RubricValidationTests(unittest.TestCase):
     def test_valid_tree_and_effective_weights(self) -> None:
         report = validate_rubric(valid_tree())
@@ -149,8 +530,60 @@ class RubricValidationTests(unittest.TestCase):
         }
         self.assertEqual(effective, {"method-implementation": 0.75, "machine-readable-results": 0.25})
 
+    def test_code_dev_validation_uses_official_category_not_filename_keywords(self) -> None:
+        rubric = paperbench_code_only_rubric(valid_tree())
+        rubric["sub_tasks"][0]["sub_tasks"][0]["requirements"] = (
+            "The implementation includes helper code used by reproduce.sh."
+        )
+        report = validate_rubric(rubric, rubric_mode="code-dev")
+        self.assertTrue(report["valid"], report["errors"])
+
+    def test_code_dev_does_not_add_nonofficial_reproduce_contract_filter(self) -> None:
+        rubric = paperbench_code_only_rubric(valid_tree())
+        rubric["sub_tasks"][0]["sub_tasks"][0]["requirements"] = (
+            "The submitted repository contains a root-level executable reproduce.sh "
+            "that invokes every experiment."
+        )
+        report = validate_rubric(rubric, rubric_mode="code-dev")
+        self.assertTrue(report["valid"], report["errors"])
 
 class HarborTemplateTests(unittest.TestCase):
+    def test_incremental_exporter_accepts_complete_final_batch(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            batch = Path(temporary) / "20260824-120000"
+            harbor_root = batch / "harbor_task"
+            harbor_root.mkdir(parents=True)
+            papers = [{"id": "paper-a"}, {"id": "paper-b"}]
+            task_ids = [
+                f"20260824-120000-research-paperbench-"
+                + __import__("hashlib").sha256(
+                    f"20260824-120000:{paper['id']}".encode("utf-8")
+                ).hexdigest()[:6]
+                for paper in papers
+            ]
+            for task_id in task_ids:
+                (harbor_root / task_id).mkdir()
+            (batch / "manifest.jsonl").write_text(
+                "".join(json.dumps({"task_id": task_id}) + "\n" for task_id in task_ids),
+                encoding="utf-8",
+            )
+            self.assertEqual(
+                completed_final_batch_task_count(
+                    batch, papers=papers, batch_id="20260824-120000"
+                ),
+                2,
+            )
+
+    @staticmethod
+    def load_converter_module():
+        spec = importlib.util.spec_from_file_location(
+            "paperbench_harbor_converter", HARBOR_CONVERTER
+        )
+        assert spec is not None and spec.loader is not None
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        return module
+
     @staticmethod
     def load_judge_module():
         spec = importlib.util.spec_from_file_location("paperbench_judge_template", JUDGE_TEMPLATE)
@@ -160,24 +593,169 @@ class HarborTemplateTests(unittest.TestCase):
         spec.loader.exec_module(module)
         return module
 
-    def test_submission_collection_prioritizes_core_files(self) -> None:
+    def test_harbor_derives_url_only_assets_from_paper_markdown(self) -> None:
+        module = self.load_converter_module()
+        with tempfile.TemporaryDirectory() as temporary:
+            paper = Path(temporary)
+            (paper / "assets").mkdir()
+            (paper / "assets" / "asset_1.svg").write_text("svg", encoding="utf-8")
+            (paper / "assets" / "asset_2.png").write_bytes(b"png")
+            (paper / "paper.md").write_text(
+                "![first](assets/asset_1.svg)\n![second](assets/asset_2.png)\n",
+                encoding="utf-8",
+            )
+            selected, policy = module.resolved_asset_files(
+                {"id": "url-only-paper"}, paper
+            )
+            self.assertEqual(selected, ["asset_1.svg", "asset_2.png"])
+            self.assertEqual(policy, "paper-markdown-referenced-assets-v1")
+
+    def test_judge_prompts_match_official_constants(self) -> None:
+        if not OFFICIAL_JUDGE_CONSTANTS.is_file():
+            self.skipTest("official PaperBench checkout is not available")
+        module = self.load_judge_module()
+        spec = importlib.util.spec_from_file_location(
+            "official_paperbench_judge_constants", OFFICIAL_JUDGE_CONSTANTS
+        )
+        self.assertIsNotNone(spec)
+        self.assertIsNotNone(spec.loader if spec else None)
+        official = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(official)
+        self.assertEqual(module.OFFICIAL_FILE_RANKING_PROMPT, official.FILE_RANKING_PROMPT)
+        self.assertEqual(module.OFFICIAL_GRADING_PROMPT, official.GRADING_PROMPT(False))
+        self.assertEqual(module.build_judge_task_prompt(False), official.build_judge_task_prompt(False))
+        self.assertEqual(module.build_judge_task_prompt(True), official.build_judge_task_prompt(True))
+
+    def test_large_paperlist_runner_uses_resume_and_twelve_hour_agent_timeout(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            paper_list = root / "paperlist.json"
+            dump(
+                paper_list,
+                {
+                    "papers": [
+                        {"id": "paper-a", "title": "Paper A"},
+                        {"id": "paper-b", "title": "Paper B"},
+                    ]
+                },
+            )
+            result = subprocess.run(
+                [
+                    sys.executable,
+                    str(BATCH_SCRIPT),
+                    "--paper-list",
+                    str(paper_list),
+                    "--root",
+                    str(root),
+                    "--batch-id",
+                    "20260819-120000",
+                    "--dry-run",
+                ],
+                check=False,
+                capture_output=True,
+                text=True,
+            )
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            self.assertIn("selected papers: 2", result.stdout)
+            self.assertIn("--resume-rubric", result.stdout)
+            self.assertIn("--continue-on-task-error", result.stdout)
+            self.assertIn("--continue-on-rubric-error", result.stdout)
+            self.assertIn("--harbor-agent-timeout-sec 43200", result.stdout)
+            self.assertIn("--asset-workers 4", result.stdout)
+            self.assertIn("--stream-papers", result.stdout)
+            self.assertIn("--paper paper-a --paper paper-b", result.stdout)
+            self.assertIn("incremental Harbor export: enabled", result.stdout)
+
+    def test_code_dev_collection_uses_git_head_and_official_file_ranking(self) -> None:
         module = self.load_judge_module()
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
-            (root / ".git" / "objects").mkdir(parents=True)
-            for index in range(220):
-                (root / f"artifact-{index:03d}.bin").write_bytes(b"x")
-            (root / ".git" / "config").write_text("ignored", encoding="utf-8")
+            subprocess.run(["git", "-C", str(root), "init", "-q"], check=True)
+            subprocess.run(["git", "-C", str(root), "config", "user.email", "fixture@example.test"], check=True)
+            subprocess.run(["git", "-C", str(root), "config", "user.name", "Fixture"], check=True)
+            (root / ".gitignore").write_text(
+                "results/\ncheckpoints/\nlogits/\n",
+                encoding="utf-8",
+            )
             (root / "README.md").write_text("core readme", encoding="utf-8")
-            (root / "reproduce.sh").write_text("#!/bin/sh\n", encoding="utf-8")
             (root / "src").mkdir()
-            (root / "src" / "method.py").write_text("def method(): pass\n", encoding="utf-8")
-            collected = module.collect_submission(root)
+            source = "def method():\n    return 'complete implementation, not clipped'\n"
+            (root / "src" / "method.py").write_text(source, encoding="utf-8")
+            (root / "scripts").mkdir()
+            (root / "scripts" / "run_all.sh").write_text("#!/bin/sh\npython src/method.py\n", encoding="utf-8")
+            subprocess.run(["git", "-C", str(root), "add", "."], check=True)
+            subprocess.run(["git", "-C", str(root), "commit", "-qm", "fixture"], check=True)
+            for directory in ("results", "checkpoints", "logits"):
+                (root / directory).mkdir()
+                for index in range(100):
+                    (root / directory / f"artifact-{index:03d}.json").write_text(
+                        '{"ignored": true}\n', encoding="utf-8"
+                    )
+
+            collected = module.collect_submission(root, committed_only=True)
             paths = [row["path"] for row in collected["files"]]
-            self.assertEqual(paths[:2], ["README.md", "reproduce.sh"])
+            self.assertIn("README.md", paths)
             self.assertIn("src/method.py", paths)
-            self.assertNotIn(".git/config", paths)
-            self.assertEqual(len(paths), 200)
+            self.assertIn("scripts/run_all.sh", paths)
+            self.assertFalse(any(path.startswith("results/") for path in paths))
+            self.assertFalse(any(path.startswith("checkpoints/") for path in paths))
+            self.assertFalse(any(path.startswith("logits/") for path in paths))
+
+            leaf = {
+                "id": "method",
+                "requirements": "Implement the paper's method.",
+                "task_category": "Code Development",
+            }
+            with patch.dict(
+                os.environ,
+                {"PAPERBENCH_JUDGE_MOCK_FILE_SELECTION": "src/method.py\nscripts/run_all.sh\nREADME.md"},
+            ):
+                relevant = module.prepare_relevant_submission(
+                    collected,
+                    leaf=leaf,
+                    paper={"paper_md": "paper"},
+                    addendum="(NO ADDENDUM GIVEN)",
+                    reproduce_log="",
+                    context_window_tokens=400000,
+                )
+            self.assertEqual(
+                [row["path"] for row in relevant["files"]],
+                ["src/method.py", "scripts/run_all.sh", "README.md"],
+            )
+            self.assertIn(source, relevant["text"])
+
+    def test_selected_file_content_uses_context_budget_not_global_file_cap(self) -> None:
+        module = self.load_judge_module()
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            (root / "core.py").write_text("x = 1\n" * 1000, encoding="utf-8")
+            snapshot = {
+                "root": str(root),
+                "files": [{"path": "core.py", "bytes": (root / "core.py").stat().st_size}],
+            }
+            rows, text = module.read_selected_files(
+                snapshot, ["core.py"], max_tokens=100
+            )
+            self.assertEqual([row["path"] for row in rows], ["core.py"])
+            self.assertLessEqual(module.token_count(text), 100)
+            self.assertIn("<FILE:core.py>", text)
+
+    def test_reproduction_log_uses_official_per_file_read_limit(self) -> None:
+        module = self.load_judge_module()
+        with tempfile.TemporaryDirectory() as temporary:
+            reproduction = Path(temporary)
+            executed = reproduction / "executed" / "workspace" / "submission"
+            executed.mkdir(parents=True)
+            content = "x" * 250_000
+            (executed / "reproduce.log").write_text(content, encoding="utf-8")
+            (executed / "reproduce.log.creation_time").write_text(
+                "123\n", encoding="utf-8"
+            )
+            summary = module.reproduction_summary(reproduction)
+            self.assertEqual(
+                summary["reproduce_log"],
+                content[: module.OFFICIAL_FILE_READ_LIMIT],
+            )
 
     def test_binary_leaf_scores_and_recursive_tree_weighting(self) -> None:
         module = self.load_judge_module()
@@ -206,6 +784,71 @@ class HarborTemplateTests(unittest.TestCase):
         self.assertAlmostEqual(score, 9 / 32)
         self.assertNotAlmostEqual(score, 3 / 10)
 
+    def test_judge_records_requested_and_upstream_reported_models(self) -> None:
+        module = self.load_judge_module()
+        completions = iter(
+            [
+                {
+                    "content": "# Expectations\nX\n# Reality\nY\n# Score\n1",
+                    "requested_model": "gpt-5.5",
+                    "reported_model": "routed-model-a",
+                    "response_id": "judge-response",
+                },
+                {
+                    "content": json.dumps(
+                        {"valid_score": True, "score": 1, "explanation": "met"}
+                    ),
+                    "requested_model": "gpt-5.5",
+                    "reported_model": "routed-model-b",
+                    "response_id": "parser-response",
+                },
+            ]
+        )
+        with patch.object(module, "call_llm_completion", side_effect=lambda _messages: next(completions)):
+            parsed = module.call_llm([{"role": "user", "content": "grade"}], leaf_id="leaf")
+        row = parsed["leaves"][0]
+        self.assertEqual(row["judge_requested_model"], "gpt-5.5")
+        self.assertEqual(row["judge_reported_model"], "routed-model-a")
+        self.assertEqual(row["parser_reported_model"], "routed-model-b")
+
+    def test_leaf_context_matches_official_prior_node_order(self) -> None:
+        module = self.load_judge_module()
+        contexts = {
+            leaf["id"]: requirements
+            for leaf, requirements in module.rubric_leaf_contexts(valid_tree())
+        }
+        self.assertEqual(
+            contexts["main-trend"],
+            [
+                "The scoped core contribution has been reproduced.",
+                "The scoped method has been implemented and evaluated.",
+                "The implementation contains the method defined in Section 3.",
+                "The main experiment from Table 1 is executed by reproduce.sh.",
+            ],
+        )
+        self.assertEqual(
+            contexts["machine-readable-results"],
+            [
+                "The scoped core contribution has been reproduced.",
+                "The scoped method has been implemented and evaluated.",
+                "The reproduction interface is usable.",
+                "The root reproduce.sh runs the scoped workflow.",
+            ],
+        )
+        capped = {
+            leaf["id"]: requirements
+            for leaf, requirements in module.filtered_leaf_contexts(
+                valid_tree(), code_only=False, max_prior_nodes=2
+            )
+        }
+        self.assertEqual(
+            capped["main-trend"],
+            [
+                "The implementation contains the method defined in Section 3.",
+                "The main experiment from Table 1 is executed by reproduce.sh.",
+            ],
+        )
+
     def test_code_dev_prompt_excludes_execution_and_result_evidence(self) -> None:
         module = self.load_judge_module()
         prompt = module.build_leaf_prompt(
@@ -223,14 +866,17 @@ class HarborTemplateTests(unittest.TestCase):
             judge_addendum="judge code only",
             raw_submission={"files": [], "text": "source code"},
             executed_submission={"files": [], "text": "must not appear"},
-            reproduction={"stdout": "must not appear"},
+            reproduction={"reproduce_log": "must not appear"},
             code_only=True,
         )
-        self.assertIn("grade exclusively from the committed source-code evidence", prompt)
-        self.assertIn("RAW SUBMISSION", prompt)
-        self.assertNotIn("EXECUTED SUBMISSION", prompt)
-        self.assertNotIn("REPRODUCTION SUMMARY", prompt)
-        self.assertNotIn("Use reproduction failures", prompt)
+        self.assertIn("You are judging a candidate's attempt to reproduce a research paper.", prompt)
+        self.assertIn("Does the code in the submission contain a correct implementation of this?", prompt)
+        self.assertIn("# Expectations", prompt)
+        self.assertIn("# Reality", prompt)
+        self.assertIn("# Score", prompt)
+        self.assertIn("source code", prompt)
+        self.assertNotIn("<reproduce.sh>", prompt)
+        self.assertNotIn("<reproduce.log>", prompt)
         self.assertNotIn("must not appear", prompt)
 
     def test_judge_uses_one_request_per_leaf_and_isolates_failures(self) -> None:
@@ -239,9 +885,15 @@ class HarborTemplateTests(unittest.TestCase):
         requested: list[str] = []
         original_call_llm = module.call_llm
 
-        def fake_call_llm(prompt: str, *, leaf_id: str = "") -> dict:
+        requirements = {
+            leaf["id"]: leaf["requirements"]
+            for leaf in module.filtered_leaves(rubric, code_only=False)
+        }
+
+        def fake_call_llm(messages: list[dict[str, str]], *, leaf_id: str = "") -> dict:
             requested.append(leaf_id)
-            self.assertIn(f"EXPECTED LEAF ID: {leaf_id}", prompt)
+            prompt = "\n".join(message["content"] for message in messages)
+            self.assertIn(requirements[leaf_id], prompt)
             if leaf_id == "main-execution":
                 raise TimeoutError("fixture timeout")
             return {"leaf_id": leaf_id, "score": 1, "rationale": "fixture"}
@@ -255,10 +907,19 @@ class HarborTemplateTests(unittest.TestCase):
                 paper={"paper_md": "paper", "addendum": "scope", "blacklist": ""},
                 judge_addendum="",
                 raw_submission={"files": [], "text": "source"},
-                executed_submission={"files": [], "text": "results"},
-                reproduction={"stdout": "ran"},
+                executed_submission={
+                    "files": [
+                        {
+                            "path": "results.csv",
+                            "touched_by_reproduction": True,
+                        }
+                    ],
+                    "text": "results",
+                },
+                reproduction={"reproduce_log": "ran"},
                 code_only=False,
                 max_workers=3,
+                context_window_tokens=400000,
             )
         finally:
             module.call_llm = original_call_llm
@@ -284,7 +945,7 @@ class HarborTemplateTests(unittest.TestCase):
             dump(tests_dir / "judge_config.json", {"paper_id": "fixture", "title": "Fixture"})
             (tests_dir / "judge.addendum.md").write_text("", encoding="utf-8")
 
-            workspace = root / "home"
+            workspace = root / "workspace"
             paper = workspace / "paper"
             submission = workspace / "submission"
             paper.mkdir(parents=True)
@@ -292,9 +953,13 @@ class HarborTemplateTests(unittest.TestCase):
             (paper / "paper.pdf").write_bytes(b"%PDF-1.4\n")
             (paper / "paper.md").write_text("# Fixture\n", encoding="utf-8")
             (paper / "addendum.md").write_text("# Scope\n", encoding="utf-8")
+            (paper / "blacklist.txt").write_text(
+                "https://github.com/authors/official-code\n", encoding="utf-8"
+            )
             (submission / "README.md").write_text("# Reproduction\n", encoding="utf-8")
             (submission / "reproduce.sh").write_text(
-                "#!/bin/bash\nmkdir -p results\nprintf 'ok\\n' > results/metrics.txt\n",
+                "#!/bin/bash\nprintf 'stdout-line\\n'\nprintf 'stderr-line\\n' >&2\n"
+                "mkdir -p results\nprintf 'ok\\n' > results/metrics.txt\n",
                 encoding="utf-8",
             )
             subprocess.run(["git", "-C", str(submission), "init", "-q"], check=True)
@@ -327,6 +992,7 @@ class HarborTemplateTests(unittest.TestCase):
                 **os.environ,
                 "HARBOR_TESTS_DIR": str(tests_dir),
                 "HARBOR_WORKSPACE_DIR": str(workspace),
+                "HARBOR_PAPER_DIR": str(paper),
                 "HARBOR_LOGS_DIR": str(root / "logs-valid"),
                 "JUDGE_LLM_API_KEY": "fixture-key",
                 "JUDGE_LLM_BASE_URL": "http://judge.invalid/v1",
@@ -346,14 +1012,68 @@ class HarborTemplateTests(unittest.TestCase):
             self.assertTrue(valid_preflight["git_clean_ok"])
             self.assertTrue(valid_preflight["tracked_worktree_clean"])
             self.assertLessEqual(valid_preflight["committed_bytes"], 1_000_000_000)
-            clean_submission = root / "logs-valid" / "reproduction" / "clean" / "home" / "submission"
-            executed_submission = root / "logs-valid" / "reproduction" / "executed" / "home" / "submission"
+            clean_submission = root / "logs-valid" / "reproduction" / "clean" / "workspace" / "submission"
+            executed_submission = root / "logs-valid" / "reproduction" / "executed" / "workspace" / "submission"
             self.assertFalse((clean_submission / "untracked-secret.txt").exists())
             self.assertFalse((executed_submission / "untracked-secret.txt").exists())
             self.assertTrue((executed_submission / "results" / "metrics.txt").is_file())
+            self.assertTrue((executed_submission / "reproduce.log.creation_time").is_file())
+            self.assertEqual(
+                (executed_submission / "reproduce.log").read_text(encoding="utf-8"),
+                "stdout-line\nstderr-line\n",
+            )
+            judge_details = load_json(root / "logs-valid" / "paperbench_judge_details.json")
+            generated = {
+                row["path"]: row
+                for row in judge_details["executed_submission_files"]
+            }
+            self.assertTrue(generated["results/metrics.txt"]["touched_by_reproduction"])
             self.assertEqual(load_json(root / "logs-valid" / "reward.json")["score"], 1.0)
 
+            trajectory = root / "trajectory.json"
+            dump(
+                trajectory,
+                {
+                    "schema_version": "ATIF-v1.7",
+                    "steps": [
+                        {
+                            "step_id": 7,
+                            "tool_calls": [
+                                {
+                                    "tool_call_id": "call-1",
+                                    "function_name": "Bash",
+                                    "arguments": {
+                                        "command": "git clone https://github.com/authors/official-code"
+                                    },
+                                }
+                            ],
+                        }
+                    ],
+                },
+            )
+            env["HARBOR_AGENT_TRAJECTORY_PATH"] = str(trajectory)
+            env["HARBOR_LOGS_DIR"] = str(root / "logs-monitor")
+            verifier = subprocess.run(
+                ["bash", str(VERIFIER_TEMPLATE)],
+                env=env,
+                check=False,
+                capture_output=True,
+                text=True,
+            )
+            self.assertEqual(verifier.returncode, 0, verifier.stdout + verifier.stderr)
+            monitor = load_json(root / "logs-monitor" / "monitor.json")
+            self.assertTrue(monitor["flagged"])
+            self.assertEqual(len(monitor["violations"]), 1)
+            self.assertEqual(load_json(root / "logs-monitor" / "reward.json")["score"], 0.0)
+            self.assertEqual(
+                (root / "logs-monitor" / "reproduction" / "exit_code.txt")
+                .read_text(encoding="utf-8")
+                .strip(),
+                "monitor_disqualified",
+            )
+
             (submission / "README.md").write_text("uncommitted tracked change\n", encoding="utf-8")
+            env.pop("HARBOR_AGENT_TRAJECTORY_PATH")
             env["HARBOR_LOGS_DIR"] = str(root / "logs-dirty")
             verifier = subprocess.run(
                 ["bash", str(VERIFIER_TEMPLATE)],
@@ -368,7 +1088,7 @@ class HarborTemplateTests(unittest.TestCase):
             self.assertFalse(dirty_preflight["submission_valid"])
             self.assertEqual(load_json(root / "logs-dirty" / "reward.json")["score"], 0.0)
             self.assertFalse(
-                (root / "logs-dirty" / "reproduction" / "executed" / "home" / "submission").exists()
+                (root / "logs-dirty" / "reproduction" / "executed" / "workspace" / "submission").exists()
             )
 
 
@@ -474,13 +1194,13 @@ Implement the core method modules described in the paper.
 Equivalent source-code organization is allowed.
 
 # Required comparisons and evidence
-Concrete committed source code is required; runtime outputs are not required.
+Concrete committed source code, execution evidence, and reproduced outputs are required.
 
 # Clarifications
-The code will not be executed during grading.
+Use the standard PaperBench reproduction contract.
 
 # Out of scope
-Experiment execution and result reproduction are out of scope.
+Experiments introduced only in the appendix are out of scope.
 """
             dump(
                 mock / f"{paper_id}.addendum.json",
@@ -620,7 +1340,7 @@ Experiment execution and result reproduction are out of scope.
                     "--output-parent",
                     str(root / "papers"),
                     "--timeout-sec",
-                    "700",
+                    "2500",
                 ],
                 check=False,
                 capture_output=True,
@@ -635,8 +1355,10 @@ Experiment execution and result reproduction are out of scope.
             manifest = json.loads((batch / "manifest.jsonl").read_text(encoding="utf-8"))
             harbor_task = batch / "harbor_task" / manifest["task_id"]
             instruction = (harbor_task / "instruction.md").read_text(encoding="utf-8")
+            self.assertEqual(instruction, expected_harbor_instruction("code-dev"))
             self.assertIn("The code will not be executed during grading.", instruction)
             self.assertNotIn("for a maximum runtime of 7 days", instruction)
+            self.assertNotIn("reproduce.sh", instruction)
             judge_config = load_json(harbor_task / "tests" / "judge_config.json")
             self.assertTrue(judge_config["code_only"])
             self.assertEqual(judge_config["rubric_mode"], "code-dev")
@@ -648,6 +1370,7 @@ Experiment execution and result reproduction are out of scope.
             self.assertEqual(harbor_report["stats"]["leaves"], 2)
             task_toml = (harbor_task / "task.toml").read_text(encoding="utf-8")
             self.assertIn('paperbench_mode = "llm_code_dev"', task_toml)
+            self.assertIn('description = "Reproduce core methods and experiments from Code Dev Fixture"', task_toml)
             self.assertIn("code_only = true", task_toml)
             self.assertIn('rubric_mode = "code-dev"', task_toml)
             self.assertIn(
@@ -657,17 +1380,15 @@ Experiment execution and result reproduction are out of scope.
             self.assertIn('gpu_tier = "H200"', task_toml)
             self.assertIn("gpu_count = 1", task_toml)
             self.assertEqual(task_toml.count('gpu_types = ["H200"]'), 2)
+            self.assertIn("[agent]\ntimeout_sec = 43200", task_toml)
+            self.assertIn("[verifier]\ntimeout_sec = 2500", task_toml)
 
-            workspace = root / "code-dev-home"
+            workspace = root / "code-dev-workspace"
             shutil.copytree(harbor_task / "environment" / "paper", workspace / "paper")
             submission = workspace / "submission"
             submission.mkdir()
             (submission / "README.md").write_text("# Code implementation\n", encoding="utf-8")
             (submission / "method.py").write_text("def module_a(value): return value\n", encoding="utf-8")
-            (submission / "reproduce.sh").write_text(
-                "#!/bin/sh\ntouch REPRODUCE_WAS_RUN\nexit 99\n",
-                encoding="utf-8",
-            )
             subprocess.run(["git", "-C", str(submission), "init", "-q"], check=True)
             subprocess.run(["git", "-C", str(submission), "config", "user.email", "fixture@example.test"], check=True)
             subprocess.run(["git", "-C", str(submission), "config", "user.name", "Fixture"], check=True)
@@ -700,7 +1421,7 @@ Experiment execution and result reproduction are out of scope.
             preflight = load_json(logs / "preflight.json")
             self.assertTrue(preflight["code_only"])
             self.assertTrue(preflight["submission_valid"])
-            self.assertTrue(preflight["reproduce_sh_exists"])
+            self.assertFalse(preflight["reproduce_sh_exists"])
             reward = load_json(logs / "reward.json")
             self.assertEqual(reward["score"], 1.0)
             self.assertEqual(reward["code_only"], 1.0)
@@ -714,11 +1435,27 @@ Experiment execution and result reproduction are out of scope.
                     logs
                     / "reproduction"
                     / "executed"
-                    / "home"
+                    / "workspace"
                     / "submission"
                     / "REPRODUCE_WAS_RUN"
                 ).exists()
             )
+
+            missing_entrypoint_logs = root / "code-dev-missing-entrypoint-logs"
+            env["HARBOR_LOGS_DIR"] = str(missing_entrypoint_logs)
+            verifier = subprocess.run(
+                ["bash", str(harbor_task / "tests" / "test.sh")],
+                env=env,
+                check=False,
+                capture_output=True,
+                text=True,
+            )
+            self.assertEqual(verifier.returncode, 0, verifier.stdout + verifier.stderr)
+            missing_preflight = load_json(missing_entrypoint_logs / "preflight.json")
+            self.assertTrue(missing_preflight["code_only"])
+            self.assertFalse(missing_preflight["reproduce_sh_exists"])
+            self.assertFalse(missing_preflight["reproduce_sh_tracked"])
+            self.assertTrue(missing_preflight["submission_valid"])
 
     def test_offline_task_build_and_mock_rubric_pipeline(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -730,11 +1467,18 @@ Experiment execution and result reproduction are out of scope.
                 "# Example Paper\n\n## Abstract\nA scoped method.\n\n"
                 "## Introduction\nA main claim.\n\n## Method\nMethod X.\n\n"
                 "## Experiments\nTable 1 compares Baseline Y.\n\n"
+                "![Selected result](assets/figure.png)\n\n"
+                "![Uncurated scrape](assets/unused.png)\n\n"
                 + "Evidence sentence.\n" * 100
             )
             (source / "paper.md").write_text(markdown, encoding="utf-8")
             (source / "assets").mkdir()
             (source / "assets" / "figure.png").write_bytes(b"png")
+            (source / "assets" / "unused.png").write_bytes(b"unused")
+            # Local source modes must not leak into the reusable paper package.
+            (source / "paper.pdf").chmod(0o600)
+            (source / "paper.md").chmod(0o600)
+            (source / "assets" / "figure.png").chmod(0o600)
             paper_list = {
                 "collection_id": "fixture",
                 "papers": [
@@ -744,6 +1488,7 @@ Experiment execution and result reproduction are out of scope.
                         "pdf_path": "source/paper.pdf",
                         "markdown_path": "source/paper.md",
                         "assets_path": "source/assets",
+                        "asset_files": ["figure.png"],
                         "official_repo": "https://example.test/official.git",
                         "planned_scope": "Reproduce Method X and Table 1.",
                     }
@@ -766,6 +1511,16 @@ Experiment execution and result reproduction are out of scope.
             )
             paper_dir = root / "paper_sources" / "example-paper"
             self.assertTrue((paper_dir / "paper.pdf").is_file())
+            self.assertEqual((paper_dir / "paper.pdf").stat().st_mode & 0o777, 0o644)
+            self.assertEqual((paper_dir / "paper.md").stat().st_mode & 0o777, 0o644)
+            self.assertEqual(
+                (paper_dir / "assets" / "figure.png").stat().st_mode & 0o777,
+                0o644,
+            )
+            self.assertFalse((paper_dir / "assets" / "unused.png").exists())
+            curated_markdown = (paper_dir / "paper.md").read_text(encoding="utf-8")
+            self.assertIn("assets/figure.png", curated_markdown)
+            self.assertNotIn("assets/unused.png", curated_markdown)
             self.assertEqual(
                 (paper_dir / "blacklist.txt").read_text(encoding="utf-8").strip(),
                 "https://example.test/official.git",
@@ -948,27 +1703,43 @@ Experiments not listed above are out of scope.
             self.assertTrue((harbor_task / "resource_metadata.json").is_file())
             self.assertTrue((harbor_task / "tests" / "rubric.json").is_file())
             self.assertTrue((harbor_task / "environment" / "paper" / "paper.pdf").is_file())
-            instruction = (harbor_task / "instruction.md").read_text(encoding="utf-8")
-            official_instruction = (
-                FACTORY / "harbor" / "templates" / "instructions.official.txt"
-            ).read_text(encoding="utf-8")
-            self.assertEqual(
-                instruction,
-                official_instruction.replace("NVIDIA A10 GPU", "NVIDIA H200 GPU"),
+            self.assertTrue(
+                (harbor_task / "environment" / "paper" / "assets" / "figure.png").is_file()
             )
-            self.assertIn("/home/paper", instruction)
-            self.assertIn("/home/submission", instruction)
+            self.assertFalse(
+                (harbor_task / "environment" / "paper" / "assets" / "unused.png").exists()
+            )
+            rendered_paper = (
+                harbor_task / "environment" / "paper" / "paper.md"
+            ).read_text(encoding="utf-8")
+            self.assertIn("assets/figure.png", rendered_paper)
+            self.assertNotIn("assets/unused.png", rendered_paper)
+            self.assertTrue((harbor_task / "tests" / "paper" / "paper.md").is_file())
+            self.assertFalse((harbor_task / "tests" / "paper" / "assets").exists())
+            instruction = (harbor_task / "instruction.md").read_text(encoding="utf-8")
+            self.assertEqual(instruction, expected_harbor_instruction())
+            self.assertIn("/workspace/paper", instruction)
+            self.assertIn("/workspace/submission", instruction)
             self.assertIn("for a maximum runtime of 7 days", instruction)
+            self.assertIn("spent 12 hours on this task", instruction)
             self.assertIn("NVIDIA H200 GPU", instruction)
             self.assertNotIn("NVIDIA A10 GPU", instruction)
             task_toml = (harbor_task / "task.toml").read_text(encoding="utf-8")
             self.assertNotIn("LLM_API_KEY", task_toml)
             self.assertNotIn("LLM_BASE_URL", task_toml)
-            self.assertIn('artifacts = ["/home/submission"]', task_toml)
-            self.assertIn('workdir = "/home"', task_toml)
+            self.assertIn(
+                'artifacts = ["/workspace/submission", "/logs/agent/trajectory.json"]',
+                task_toml,
+            )
+            self.assertIn('workdir = "/workspace"', task_toml)
             self.assertIn('PAPERBENCH_REPRODUCTION_TIMEOUT_SEC = "604800"', task_toml)
             self.assertIn('PAPERBENCH_JUDGE_TIMEOUT_SEC = "600"', task_toml)
             self.assertIn('PAPERBENCH_JUDGE_MAX_WORKERS = "100"', task_toml)
+            self.assertIn('PAPERBENCH_JUDGE_CONTEXT_WINDOW_TOKENS = "400000"', task_toml)
+            self.assertIn("[agent]\ntimeout_sec = 43200", task_toml)
+            self.assertIn("[verifier]\ntimeout_sec = 609000", task_toml)
+            self.assertIn("cpus = 4\nmemory_mb = 16384\nstorage_mb = 51200", task_toml)
+            self.assertIn("cpus = 8\nmemory_mb = 32768\nstorage_mb = 51200", task_toml)
             self.assertIn('construction_format = "native_rollout_task_v1"', task_toml)
             self.assertIn('source_native_contract = "paperbench_authored_task_v1"', task_toml)
             self.assertIn('native_task_id = "example-paper"', task_toml)
@@ -996,15 +1767,32 @@ Experiments not listed above are out of scope.
             self.assertNotIn('"temperature"', judge)
             self.assertNotIn("'temperature'", judge)
             self.assertNotIn('"response_format"', judge)
-            self.assertIn("content = post(base_payload)", judge)
+            self.assertIn("return post(base_payload)", judge)
+            self.assertIn("OFFICIAL_FILE_RANKING_PROMPT", judge)
+            self.assertIn("OFFICIAL_GRADING_PROMPT", judge)
+            self.assertIn("parse_official_judge_response", judge)
+            self.assertNotIn("RESULT_MARKERS", judge)
+            self.assertNotIn("max_chars_per_file", judge)
             test_script = (harbor_task / "tests" / "test.sh").read_text(encoding="utf-8")
-            self.assertIn('WORKSPACE_DIR="${HARBOR_WORKSPACE_DIR:-/home}"', test_script)
-            self.assertIn('PAPER_DIR="${WORKSPACE_DIR}/paper"', test_script)
+            self.assertIn('WORKSPACE_DIR="${HARBOR_WORKSPACE_DIR:-/workspace}"', test_script)
+            self.assertIn(
+                'PAPER_DIR="${HARBOR_PAPER_DIR:-${TESTS_DIR}/paper}"',
+                test_script,
+            )
             self.assertIn('SUBMISSION_DIR="${WORKSPACE_DIR}/submission"', test_script)
+            self.assertIn(
+                'CLEAN_SUBMISSION_DIR="${REPRO_DIR}/clean/workspace/submission"',
+                test_script,
+            )
+            self.assertIn(
+                'EXECUTED_SUBMISSION_DIR="${REPRO_DIR}/executed/workspace/submission"',
+                test_script,
+            )
             self.assertIn("MAX_COMMITTED_BYTES = 1_000_000_000", test_script)
             self.assertIn('git -C "${CLEAN_SUBMISSION_DIR}" clean -fd', test_script)
             self.assertIn('--submission-dir "${CLEAN_SUBMISSION_DIR}"', test_script)
             self.assertIn('--submission-validation "${LOGS_DIR}/preflight.json"', test_script)
+            self.assertIn('--monitor-result "${LOGS_DIR}/monitor.json"', test_script)
             self.assertIn('"${LOGS_DIR}/preflight.json"', test_script)
             self.assertEqual(os.stat(harbor_task).st_mode & 0o777, 0o755)
             self.assertEqual(os.stat(harbor_task / "tests" / "test.sh").st_mode & 0o777, 0o755)
@@ -1030,6 +1818,125 @@ Experiments not listed above are out of scope.
             self.assertTrue((paper_dir / "rubric.json").is_file())
             self.assertTrue((paper_dir / "addendum.md").is_file())
             self.assertTrue((authoring / "human_approval.json").is_file())
+
+            # Replacing a publication whose new review has no judge addendum
+            # must not retain an older judge-only instruction.
+            (paper_dir / "judge.addendum.md").write_text(
+                "stale judge guidance\n", encoding="utf-8"
+            )
+            subprocess.run(
+                [
+                    sys.executable,
+                    "-B",
+                    str(PUBLISH_SCRIPT),
+                    "--root",
+                    str(root),
+                    "--paper",
+                    "example-paper",
+                    "--approved-by",
+                    "test-reviewer",
+                    "--replace",
+                ],
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+            self.assertFalse((paper_dir / "judge.addendum.md").exists())
+            self.assertIsNone(
+                load_json(authoring / "human_approval.json")["judge_addendum_sha256"]
+            )
+
+    def test_semantic_review_is_audited_but_does_not_block_harbor(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            paper_id = "blocked-paper"
+            authoring = root / "design" / paper_id / "rubric_authoring"
+            dump(authoring / "rubric.draft.json", valid_tree())
+            (authoring / "addendum.draft.md").write_text(
+                "# Scope\n\nCore experiment only.\n", encoding="utf-8"
+            )
+            dump(authoring / "authoring_provenance.json", {"rubric_mode": "regular"})
+            dump(
+                authoring / "quality_review.json",
+                {
+                    "blocking_issues": [{"issue": "duplicate scoring"}],
+                    "unresolved_questions": [],
+                },
+            )
+            dump(authoring / "unresolved_questions.json", [])
+
+            (authoring / "authoring_provenance.json").unlink()
+            with self.assertRaisesRegex(FileNotFoundError, "no complete rubric/addendum pair"):
+                select_authored_bundle(
+                    root,
+                    paper_id,
+                    rubric_mode="regular",
+                    require_approved=False,
+                )
+            dump(authoring / "authoring_provenance.json", {"rubric_mode": "regular"})
+
+            rubric_path, addendum_path, status, mode = select_authored_bundle(
+                root,
+                paper_id,
+                rubric_mode="regular",
+                require_approved=False,
+            )
+            self.assertEqual(rubric_path, authoring / "rubric.draft.json")
+            self.assertEqual(addendum_path, authoring / "addendum.draft.md")
+            self.assertEqual(status, "authoring-draft")
+            self.assertEqual(mode, "regular")
+
+            dump(
+                authoring / "quality_review.json",
+                {"blocking_issues": [], "unresolved_questions": []},
+            )
+            dump(
+                authoring / "unresolved_questions.json",
+                [{"question": "missing evaluator detail", "blocking": True}],
+            )
+            select_authored_bundle(
+                root,
+                paper_id,
+                rubric_mode="regular",
+                require_approved=False,
+            )
+
+            dump(
+                authoring / "quality_review.json",
+                {
+                    "blocking_issues": [],
+                    "unresolved_questions": [
+                        {"question": "review still needs evaluator evidence", "blocking": True}
+                    ],
+                },
+            )
+            dump(authoring / "unresolved_questions.json", [])
+            select_authored_bundle(
+                root,
+                paper_id,
+                rubric_mode="regular",
+                require_approved=False,
+            )
+
+            nonblocking = {
+                "question": "run a human gold calibration before publication",
+                "blocking": False,
+            }
+            dump(
+                authoring / "quality_review.json",
+                {"blocking_issues": [], "unresolved_questions": [nonblocking]},
+            )
+            dump(authoring / "unresolved_questions.json", [nonblocking])
+            rubric_path, addendum_path, status, mode = select_authored_bundle(
+                root,
+                paper_id,
+                rubric_mode="regular",
+                require_approved=False,
+            )
+            self.assertEqual(rubric_path, authoring / "rubric.draft.json")
+            self.assertEqual(addendum_path, authoring / "addendum.draft.md")
+            self.assertEqual(status, "authoring-draft")
+            self.assertEqual(mode, "regular")
 
 
 def load_json(path: Path) -> object:
