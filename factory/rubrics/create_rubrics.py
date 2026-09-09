@@ -1301,7 +1301,7 @@ def main() -> None:
     guide = args.guide.read_text(encoding="utf-8")
     paper_ids = list(dict.fromkeys(args.paper_ids))
     for paper_id in paper_ids:
-        if not re.fullmatch(r"[a-z0-9]+(?:-[a-z0-9]+)*", paper_id):
+        if not re.fullmatch(r"[a-z0-9]+(?:[-._:][a-z0-9]+)*", paper_id):
             raise ValueError(f"invalid paper id: {paper_id}")
     author_papers(args, paper_ids, guide)
 

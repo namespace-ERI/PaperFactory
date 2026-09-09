@@ -529,7 +529,7 @@ def main() -> None:
     if min(args.task_workers, args.asset_workers, args.paper_workers, args.workers) < 1:
         raise ValueError("all worker counts must be at least 1")
     for paper_id in paper_ids:
-        if not re.fullmatch(r"[a-z0-9]+(?:-[a-z0-9]+)*", paper_id):
+        if not re.fullmatch(r"[a-z0-9]+(?:[-._:][a-z0-9]+)*", paper_id):
             raise ValueError(f"invalid paper id: {paper_id}")
     if (args.second_model is None) != (args.model_switch_after is None):
         raise ValueError("--second-model and --model-switch-after must be used together")

@@ -161,6 +161,31 @@ class TaskAssetTests(unittest.TestCase):
         spec.loader.exec_module(module)
         return module
 
+    def test_task_builder_accepts_namespaced_source_ids(self) -> None:
+        module = self.load_task_module()
+        module.validate_entries(
+            [
+                {
+                    "id": "arxiv:1412.6572",
+                    "title": "Generative Adversarial Nets",
+                    "pdf_url": "https://arxiv.org/pdf/1412.6572",
+                }
+            ]
+        )
+
+    def test_task_builder_rejects_path_like_ids(self) -> None:
+        module = self.load_task_module()
+        with self.assertRaisesRegex(ValueError, "id must contain"):
+            module.validate_entries(
+                [
+                    {
+                        "id": "arxiv/1412.6572",
+                        "title": "Invalid path-like id",
+                        "pdf_url": "https://arxiv.org/pdf/1412.6572",
+                    }
+                ]
+            )
+
     def test_null_official_repo_produces_empty_blacklist(self) -> None:
         module = self.load_task_module()
         self.assertEqual(module.blacklist_lines({"official_repo": None}), [])

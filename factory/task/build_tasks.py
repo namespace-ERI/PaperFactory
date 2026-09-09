@@ -29,7 +29,7 @@ from typing import Any, Callable, Iterable
 
 
 USER_AGENT = "PaperBench-task-factory/1.0"
-ID_RE = re.compile(r"^[a-z0-9]+(?:-[a-z0-9]+)*$")
+ID_RE = re.compile(r"^[a-z0-9]+(?:[-._:][a-z0-9]+)*$")
 PDF_MAGIC = b"%PDF"
 HTML_BLOCK_TAGS = {
     "address", "article", "aside", "blockquote", "div", "figcaption", "figure",
@@ -169,7 +169,9 @@ def validate_entries(entries: list[dict[str, Any]]) -> None:
         title = entry.get("title")
         label = paper_id or f"entry #{index}"
         if not isinstance(paper_id, str) or not ID_RE.fullmatch(paper_id):
-            errors.append(f"{label}: id must be non-empty kebab-case")
+            errors.append(
+                f"{label}: id must contain lowercase letters or digits separated by -._:"
+            )
         else:
             ids.append(paper_id)
         if not isinstance(title, str) or not title.strip():
