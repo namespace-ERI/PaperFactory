@@ -79,7 +79,12 @@ def export_ready_once(args: argparse.Namespace) -> tuple[int, int, int]:
     template = (args.template_task or harbor.default_template_task()).resolve()
     harbor.validate_template(template)
     instructions_file = (
-        args.instructions_file or harbor.OFFICIAL_PAPERBENCH_INSTRUCTIONS
+        args.instructions_file
+        or (
+            harbor.OFFICIAL_PAPERBENCH_CODE_DEV_INSTRUCTIONS
+            if args.rubric_mode == "code-dev"
+            else harbor.OFFICIAL_PAPERBENCH_INSTRUCTIONS
+        )
     ).resolve()
     instructions_content = harbor.render_harbor_instructions(
         instructions_file, rubric_mode=args.rubric_mode

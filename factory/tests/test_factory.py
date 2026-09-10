@@ -605,11 +605,9 @@ class HarborTemplateTests(unittest.TestCase):
             root = Path(temporary)
             paper_list = root / "paperlist.json"
             template = root / "template"
-            instructions = root / "instructions.txt"
             output_parent = root / "papers"
             dump(paper_list, {"papers": [{"id": "paper-a", "title": "Paper A"}]})
             template.mkdir()
-            instructions.write_text("placeholder\n", encoding="utf-8")
             args = type(
                 "Args",
                 (),
@@ -618,7 +616,7 @@ class HarborTemplateTests(unittest.TestCase):
                     "paper_list": paper_list,
                     "paper_ids": None,
                     "template_task": template,
-                    "instructions_file": instructions,
+                    "instructions_file": None,
                     "output_parent": output_parent,
                     "batch_id": "20260824-120000",
                     "rubric_mode": "code-dev",
@@ -636,7 +634,8 @@ class HarborTemplateTests(unittest.TestCase):
             ):
                 self.assertEqual(incremental_export.export_ready_once(args), (0, 0, 1))
             render.assert_called_once_with(
-                instructions.resolve(), rubric_mode="code-dev"
+                incremental_export.harbor.OFFICIAL_PAPERBENCH_CODE_DEV_INSTRUCTIONS.resolve(),
+                rubric_mode="code-dev",
             )
 
     @staticmethod
