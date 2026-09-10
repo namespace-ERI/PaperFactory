@@ -41,6 +41,7 @@ from rubric_lib import (  # noqa: E402
     validate_rubric,
 )
 from export_incremental import completed_final_batch_task_count  # noqa: E402
+import export_incremental as incremental_export  # noqa: E402
 from convert_to_harbor import select_authored_bundle  # noqa: E402
 
 
@@ -597,6 +598,45 @@ class HarborTemplateTests(unittest.TestCase):
                     batch, papers=papers, batch_id="20260824-120000"
                 ),
                 2,
+            )
+
+    def test_incremental_exporter_renders_selected_instruction_mode(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            paper_list = root / "paperlist.json"
+            template = root / "template"
+            instructions = root / "instructions.txt"
+            output_parent = root / "papers"
+            dump(paper_list, {"papers": [{"id": "paper-a", "title": "Paper A"}]})
+            template.mkdir()
+            instructions.write_text("placeholder\n", encoding="utf-8")
+            args = type(
+                "Args",
+                (),
+                {
+                    "root": root,
+                    "paper_list": paper_list,
+                    "paper_ids": None,
+                    "template_task": template,
+                    "instructions_file": instructions,
+                    "output_parent": output_parent,
+                    "batch_id": "20260824-120000",
+                    "rubric_mode": "code-dev",
+                    "require_approved": False,
+                },
+            )()
+            with patch.object(incremental_export.harbor, "validate_template"), patch.object(
+                incremental_export.harbor,
+                "render_harbor_instructions",
+                return_value=b"rendered",
+            ) as render, patch.object(
+                incremental_export.harbor,
+                "select_authored_bundle",
+                side_effect=FileNotFoundError,
+            ):
+                self.assertEqual(incremental_export.export_ready_once(args), (0, 0, 1))
+            render.assert_called_once_with(
+                instructions.resolve(), rubric_mode="code-dev"
             )
 
     @staticmethod

@@ -81,7 +81,9 @@ def export_ready_once(args: argparse.Namespace) -> tuple[int, int, int]:
     instructions_file = (
         args.instructions_file or harbor.OFFICIAL_PAPERBENCH_INSTRUCTIONS
     ).resolve()
-    instructions_content = harbor.render_harbor_instructions(instructions_file)
+    instructions_content = harbor.render_harbor_instructions(
+        instructions_file, rubric_mode=args.rubric_mode
+    )
     output_parent = args.output_parent.resolve()
     output_parent.mkdir(parents=True, exist_ok=True)
     batch_dir = output_parent / args.batch_id
